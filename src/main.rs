@@ -28,7 +28,6 @@ use tokio::{
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-const DEFAULT_ADDR: &str = "127.0.0.1:8764";
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_BODY_BYTES: usize = 256 * 1024;
 const MAX_CELL_INVOCATIONS: u64 = 1_000_000;
@@ -173,12 +172,19 @@ fn load_config() -> Result<RuntimeConfig> {
         .to_str()
         .ok_or_else(|| anyhow!(".cli-flags.toml path is not UTF-8"))?;
     let parser = BundledFlags2Env::new();
-    parser.audit_config(Some(config_path_text))?;
+    parser
+        .audit_config(Some(config_path_text))
+        .map_err(|error| anyhow!(error.to_string()))?;
 
     let argv = env::args().collect::<Vec<_>>();
-    let parsed = parser.parse_structured(&argv, Some(config_path_text))?;
+    let parsed = parser
+        .parse_structured(&argv, Some(config_path_text))
+        .map_err(|error| anyhow!(error.to_string()))?;
     if !parsed.unknown_options.is_empty() {
-        bail!("unknown command-line options: {}", parsed.unknown_options.len());
+        bail!(
+            "unknown command-line options: {}",
+            parsed.unknown_options.len()
+        );
     }
     if !parsed.errors.is_empty() {
         bail!("invalid command-line values: {}", parsed.errors.join("; "));
@@ -189,7 +195,9 @@ fn load_config() -> Result<RuntimeConfig> {
 
     let mut raw = env::vars().collect::<HashMap<_, _>>();
     raw.extend(parsed.provided_flags);
-    let raw_config = parser.coerce::<CliConfig, _>(&raw, Some(config_path_text))?;
+    let raw_config = parser
+        .coerce::<CliConfig, _>(&raw, Some(config_path_text))
+        .map_err(|error| anyhow!(error.to_string()))?;
 
     let addr = parse_loopback_addr(&raw_config.GS_DESKTOP_ADDR)?;
     let java_command = raw_config.GS_JAVA_COMMAND.trim().to_owned();
@@ -213,9 +221,7 @@ fn load_config() -> Result<RuntimeConfig> {
         .ok()
         .filter(|value| *value > 0 && *value <= MAX_CELL_INVOCATIONS)
         .ok_or_else(|| {
-            anyhow!(
-                "GS_MAX_CELL_INVOCATIONS must be between 1 and {MAX_CELL_INVOCATIONS}"
-            )
+            anyhow!("GS_MAX_CELL_INVOCATIONS must be between 1 and {MAX_CELL_INVOCATIONS}")
         })?;
     let token_path = match raw_config.GS_DESKTOP_TOKEN_FILE {
         Some(path) if !path.trim().is_empty() => expand_home(Path::new(&path))?,
@@ -274,11 +280,7 @@ async fn list_cells(
     let mut statuses = Vec::with_capacity(cells.len());
     for (key, cell) in cells {
         let mut cell = cell.lock().await;
-        let running = cell
-            .child
-            .try_wait()
-            .map_err(internal_error)?
-            .is_none();
+        let running = cell.child.try_wait().map_err(internal_error)?.is_none();
         statuses.push(CellStatus {
             tenant_id: key.tenant_id,
             deployment_id: key.deployment_id,
@@ -450,8 +452,8 @@ async fn invoke_cell(
         bail!("JVM cell closed its output");
     }
 
-    let response: Value = serde_json::from_str(response_line.trim())
-        .context("JVM cell returned invalid JSON")?;
+    let response: Value =
+        serde_json::from_str(response_line.trim()).context("JVM cell returned invalid JSON")?;
     if response.get("ok").and_then(Value::as_bool) != Some(true) {
         let message = response
             .get("error")
@@ -626,7 +628,7 @@ mod tests {
 
     #[test]
     fn rejects_non_loopback_bind() {
-        assert!(parse_loopback_addr(DEFAULT_ADDR).is_ok());
+        assert!(parse_loopback_addr("127.0.0.1:8764").is_ok());
         assert!(parse_loopback_addr("0.0.0.0:8764").is_err());
     }
 
@@ -644,7 +646,9 @@ mod tests {
             tenant_id: "tenant-a".to_owned(),
             deployment_id: "deploy-123".to_owned(),
         };
-        let path = artifact_path(&root, &key, "gs-lambda-cell.jar").expect("valid fixture path");
-        assert!(path.ends_with("tenant-a/deploy-123/gs-lambda-cell.jar"));
+        let valid = artifact_path(&root, &key, "gs-lambda-cell.jar")
+            .map(|path| path.ends_with("tenant-a/deploy-123/gs-lambda-cell.jar"))
+            .unwrap_or(false);
+        assert!(valid);
     }
 }
