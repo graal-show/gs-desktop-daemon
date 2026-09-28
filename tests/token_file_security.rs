@@ -88,7 +88,9 @@ fn rejects_symlink_token_path() -> Result<(), Box<dyn Error>> {
     let stderr = stderr_text(&output);
     assert!(!output.status.success());
     assert!(stderr.contains("token"));
-    assert!(stderr.contains("symlink") || stderr.contains("regular") || stderr.contains("file type"));
+    assert!(
+        stderr.contains("symlink") || stderr.contains("regular") || stderr.contains("file type")
+    );
 
     fs::remove_dir_all(root)?;
     return Ok(());
