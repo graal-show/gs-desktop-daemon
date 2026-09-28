@@ -22,7 +22,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
 use tracing_subscriber::EnvFilter;
@@ -31,6 +31,8 @@ use uuid::Uuid;
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_BODY_BYTES: usize = 256 * 1024;
 const MAX_CELL_INVOCATIONS: u64 = 1_000_000;
+const MAX_LIVE_CELLS: usize = 2048;
+const MAX_CELL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 #[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
@@ -40,6 +42,7 @@ struct CliConfig {
     GS_CELL_MAIN_CLASS: String,
     GS_ARTIFACT_ROOT: Option<String>,
     GS_MAX_CELL_INVOCATIONS: i64,
+    GS_MAX_LIVE_CELLS: i64,
     GS_DESKTOP_TOKEN_FILE: Option<String>,
     GS_DESKTOP_LOG: String,
 }
@@ -51,6 +54,7 @@ struct RuntimeConfig {
     main_class: String,
     artifact_root: PathBuf,
     max_cell_invocations: u64,
+    max_live_cells: usize,
     token_path: PathBuf,
     log_filter: String,
 }
@@ -66,6 +70,7 @@ struct Cell {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     invocation_count: u64,
+    _live_permit: OwnedSemaphorePermit,
 }
 
 #[derive(Clone)]
@@ -75,6 +80,8 @@ struct AppState {
     main_class: Arc<str>,
     artifact_root: Arc<PathBuf>,
     max_cell_invocations: u64,
+    max_live_cells: usize,
+    cell_slots: Arc<Semaphore>,
     cells: Arc<Mutex<HashMap<CellKey, Arc<Mutex<Cell>>>>>,
     started_at: Instant,
     accepted: Arc<AtomicU64>,
@@ -83,6 +90,7 @@ struct AppState {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InvocationRequest {
     invocation_id: String,
     tenant_id: String,
@@ -113,6 +121,8 @@ struct StatusResponse {
     failed: u64,
     live_cells: usize,
     max_cell_invocations: u64,
+    max_live_cells: usize,
+    available_cell_slots: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +147,8 @@ async fn main() -> Result<()> {
         main_class: Arc::from(config.main_class),
         artifact_root: Arc::new(config.artifact_root),
         max_cell_invocations: config.max_cell_invocations,
+        max_live_cells: config.max_live_cells,
+        cell_slots: Arc::new(Semaphore::new(config.max_live_cells)),
         cells: Arc::new(Mutex::new(HashMap::new())),
         started_at: Instant::now(),
         accepted: Arc::new(AtomicU64::new(0)),
@@ -223,6 +235,10 @@ fn load_config() -> Result<RuntimeConfig> {
         .ok_or_else(|| {
             anyhow!("GS_MAX_CELL_INVOCATIONS must be between 1 and {MAX_CELL_INVOCATIONS}")
         })?;
+    let max_live_cells = usize::try_from(raw_config.GS_MAX_LIVE_CELLS)
+        .ok()
+        .filter(|value| *value > 0 && *value <= MAX_LIVE_CELLS)
+        .ok_or_else(|| anyhow!("GS_MAX_LIVE_CELLS must be between 1 and {MAX_LIVE_CELLS}"))?;
     let token_path = match raw_config.GS_DESKTOP_TOKEN_FILE {
         Some(path) if !path.trim().is_empty() => expand_home(Path::new(&path))?,
         _ => default_token_path()?,
@@ -234,6 +250,7 @@ fn load_config() -> Result<RuntimeConfig> {
         main_class,
         artifact_root,
         max_cell_invocations,
+        max_live_cells,
         token_path,
         log_filter: raw_config.GS_DESKTOP_LOG,
     });
@@ -261,6 +278,8 @@ async fn status(
         failed: state.failed.load(Ordering::Relaxed),
         live_cells,
         max_cell_invocations: state.max_cell_invocations,
+        max_live_cells: state.max_live_cells,
+        available_cell_slots: state.cell_slots.available_permits(),
     }));
 }
 
@@ -330,7 +349,9 @@ async fn invoke(
         tenant_id: request.tenant_id.clone(),
         deployment_id: request.deployment_id.clone(),
     };
-    let cell = ensure_cell(&state, &key).await.map_err(internal_error)?;
+    let cell = ensure_cell(&state, &key)
+        .await
+        .map_err(service_unavailable)?;
     let result = invoke_cell(&cell, &request, Duration::from_millis(timeout_ms)).await;
     state.completed.fetch_add(1, Ordering::Relaxed);
     if result.is_err() {
@@ -384,6 +405,10 @@ async fn ensure_cell(state: &AppState, key: &CellKey) -> Result<Arc<Mutex<Cell>>
         bail!("JVM cell artifact is missing for the requested deployment");
     }
 
+    let live_permit = state.cell_slots.clone().try_acquire_owned().map_err(|_| {
+        anyhow!("live JVM cell limit reached; retire an idle cell before cold start")
+    })?;
+
     let mut child = Command::new(state.java_command.as_ref())
         .arg("-cp")
         .arg(&artifact)
@@ -414,6 +439,7 @@ async fn ensure_cell(state: &AppState, key: &CellKey) -> Result<Arc<Mutex<Cell>>
         stdin,
         stdout: BufReader::new(stdout),
         invocation_count: 0,
+        _live_permit: live_permit,
     }));
 
     let mut cells = state.cells.lock().await;
@@ -421,6 +447,7 @@ async fn ensure_cell(state: &AppState, key: &CellKey) -> Result<Arc<Mutex<Cell>>
         drop(cells);
         let mut unused = cell.lock().await;
         let _ = unused.child.kill().await;
+        let _ = unused.child.wait().await;
         return Ok(existing);
     }
     cells.insert(key.clone(), cell.clone());
@@ -444,16 +471,18 @@ async fn invoke_cell(
     cell.stdin.write_all(&line).await?;
     cell.stdin.flush().await?;
 
-    let mut response_line = String::new();
-    let bytes_read = timeout(deadline, cell.stdout.read_line(&mut response_line))
-        .await
-        .map_err(|_| anyhow!("logical actor invocation timed out; JVM cell will be retired"))??;
-    if bytes_read == 0 {
+    let response_line = timeout(
+        deadline,
+        read_bounded_line(&mut cell.stdout, MAX_CELL_RESPONSE_BYTES),
+    )
+    .await
+    .map_err(|_| anyhow!("logical actor invocation timed out; JVM cell will be retired"))??;
+    if response_line.is_empty() {
         bail!("JVM cell closed its output");
     }
 
     let response: Value =
-        serde_json::from_str(response_line.trim()).context("JVM cell returned invalid JSON")?;
+        serde_json::from_slice(&response_line).context("JVM cell returned invalid JSON")?;
     if response.get("ok").and_then(Value::as_bool) != Some(true) {
         let message = response
             .get("error")
@@ -466,11 +495,47 @@ async fn invoke_cell(
     return Ok(response.get("payload").cloned().unwrap_or(Value::Null));
 }
 
+async fn read_bounded_line(
+    reader: &mut BufReader<ChildStdout>,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    loop {
+        let (chunk, consumed, found_newline) = {
+            let buffer = reader.fill_buf().await?;
+            if buffer.is_empty() {
+                if output.is_empty() {
+                    bail!("JVM cell closed its output");
+                }
+                return Ok(output);
+            }
+            let newline = buffer.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map(|index| index + 1).unwrap_or(buffer.len());
+            if output.len().saturating_add(consumed) > max_bytes {
+                bail!("JVM cell response exceeds {max_bytes} bytes");
+            }
+            (buffer[..consumed].to_vec(), consumed, newline.is_some())
+        };
+        output.extend_from_slice(&chunk);
+        reader.consume(consumed);
+        if found_newline {
+            if output.last() == Some(&b'\n') {
+                output.pop();
+            }
+            if output.last() == Some(&b'\r') {
+                output.pop();
+            }
+            return Ok(output);
+        }
+    }
+}
+
 async fn retire_cell(state: &AppState, key: &CellKey) -> bool {
     let cell = state.cells.lock().await.remove(key);
     if let Some(cell) = cell {
         let mut cell = cell.lock().await;
         let _ = cell.child.kill().await;
+        let _ = cell.child.wait().await;
         return true;
     }
     return false;
@@ -484,6 +549,7 @@ async fn terminate_all_cells(state: &AppState) {
     for cell in cells {
         let mut cell = cell.lock().await;
         let _ = cell.child.kill().await;
+        let _ = cell.child.wait().await;
     }
 }
 
@@ -697,6 +763,14 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
 }
 
+fn service_unavailable(error: impl std::fmt::Display) -> (StatusCode, String) {
+    let message = error.to_string();
+    if message.contains("live JVM cell limit reached") {
+        return (StatusCode::SERVICE_UNAVAILABLE, message);
+    }
+    return internal_error(message);
+}
+
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
@@ -729,5 +803,15 @@ mod tests {
             .map(|path| path.ends_with("tenant-a/deploy-123/gs-lambda-cell.jar"))
             .unwrap_or(false);
         assert!(valid);
+    }
+
+    #[tokio::test]
+    async fn cell_slot_limit_is_strict() {
+        let slots = Arc::new(Semaphore::new(1));
+        let first = slots.clone().try_acquire_owned();
+        assert!(first.is_ok());
+        assert!(slots.clone().try_acquire_owned().is_err());
+        drop(first);
+        assert!(slots.try_acquire_owned().is_ok());
     }
 }

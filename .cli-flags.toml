@@ -40,6 +40,13 @@ type = "integer"
 default = 1000
 help = "Maximum successful logical actor invocations before retiring a reusable JVM cell."
 
+[flags.max-live-cells]
+env = "GS_MAX_LIVE_CELLS"
+aliases = ["max-live-cells"]
+type = "integer"
+default = 64
+help = "Maximum simultaneously resident tenant+deployment JVM cells. Capacity is reserved before JVM spawn."
+
 [flags.token-file]
 env = "GS_DESKTOP_TOKEN_FILE"
 aliases = ["token-file"]
