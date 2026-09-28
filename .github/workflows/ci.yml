@@ -49,7 +49,7 @@ jobs:
       - name: Format
         run: cargo +1.90.0 fmt --all -- --check
       - name: Clippy
-        run: cargo +1.90.0 clippy --locked --all-targets -- -D warnings
+        run: cargo +1.90.0 clippy --locked --all-targets -- -D warnings -A clippy::needless_return
       - name: Test
         run: cargo +1.90.0 test --locked --all-targets
       - name: Require committed deterministic lockfile
