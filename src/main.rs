@@ -1,10 +1,11 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use flags2env::BundledFlags2Env;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -24,12 +25,35 @@ use tokio::{
     sync::Mutex,
     time::timeout,
 };
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-const DEFAULT_ADDR: &str = "127.0.0.1:8764";
-const DEFAULT_JAVA: &str = "java";
-const DEFAULT_MAIN_CLASS: &str = "dev.graalshow.lambda.CellMain";
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
+const MAX_BODY_BYTES: usize = 256 * 1024;
+const MAX_CELL_INVOCATIONS: u64 = 1_000_000;
+
+#[allow(non_snake_case)]
+#[derive(Debug, Deserialize)]
+struct CliConfig {
+    GS_DESKTOP_ADDR: String,
+    GS_JAVA_COMMAND: String,
+    GS_CELL_MAIN_CLASS: String,
+    GS_ARTIFACT_ROOT: Option<String>,
+    GS_MAX_CELL_INVOCATIONS: i64,
+    GS_DESKTOP_TOKEN_FILE: Option<String>,
+    GS_DESKTOP_LOG: String,
+}
+
+#[derive(Debug)]
+struct RuntimeConfig {
+    addr: SocketAddr,
+    java_command: String,
+    main_class: String,
+    artifact_root: PathBuf,
+    max_cell_invocations: u64,
+    token_path: PathBuf,
+    log_filter: String,
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CellKey {
@@ -55,6 +79,7 @@ struct AppState {
     started_at: Instant,
     accepted: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,56 +103,140 @@ struct InvocationResponse {
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     runtime: &'static str,
-    actor_reusable: bool,
+    logical_actor_reusable: bool,
+    jvm_cell_reusable: bool,
     cell_reuse_scope: &'static str,
+    config_source: &'static str,
     uptime_ms: u128,
     accepted: u64,
     completed: u64,
+    failed: u64,
     live_cells: usize,
     max_cell_invocations: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct CellStatus {
+    tenant_id: String,
+    deployment_id: String,
+    invocation_count: u64,
+    running: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let config = load_config()?;
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "gs_desktop_daemon=info".into()),
-        )
+        .with_env_filter(EnvFilter::try_new(&config.log_filter).context("invalid tracing filter")?)
         .init();
 
-    let addr = parse_loopback_addr(env::var("GS_DESKTOP_ADDR").as_deref().unwrap_or(DEFAULT_ADDR))?;
-    let token = load_or_create_token(&token_path()?)?;
-    let java_command = env::var("GS_JAVA_COMMAND").unwrap_or_else(|_| DEFAULT_JAVA.to_owned());
-    let main_class = env::var("GS_CELL_MAIN_CLASS").unwrap_or_else(|_| DEFAULT_MAIN_CLASS.to_owned());
-    let artifact_root = artifact_root()?;
-    let max_cell_invocations = positive_u64_env("GS_MAX_CELL_INVOCATIONS", 1_000)?;
-
+    let token = load_or_create_token(&config.token_path)?;
     let state = AppState {
         token: Arc::from(token),
-        java_command: Arc::from(java_command),
-        main_class: Arc::from(main_class),
-        artifact_root: Arc::new(artifact_root),
-        max_cell_invocations,
+        java_command: Arc::from(config.java_command),
+        main_class: Arc::from(config.main_class),
+        artifact_root: Arc::new(config.artifact_root),
+        max_cell_invocations: config.max_cell_invocations,
         cells: Arc::new(Mutex::new(HashMap::new())),
         started_at: Instant::now(),
         accepted: Arc::new(AtomicU64::new(0)),
         completed: Arc::new(AtomicU64::new(0)),
+        failed: Arc::new(AtomicU64::new(0)),
     };
 
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/v1/status", get(status))
+        .route("/v1/doctor", get(status))
+        .route("/v1/cells", get(list_cells))
+        .route(
+            "/v1/cells/{tenant_id}/{deployment_id}/retire",
+            post(retire_cell_route),
+        )
         .route("/v1/invoke", post(invoke))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "graal-show desktop daemon listening");
+    let listener = tokio::net::TcpListener::bind(config.addr).await?;
+    tracing::info!(addr = %config.addr, "graal-show desktop daemon listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     terminate_all_cells(&state).await;
     return Ok(());
+}
+
+fn load_config() -> Result<RuntimeConfig> {
+    let config_path = resolve_config_path()?;
+    let config_path_text = config_path
+        .to_str()
+        .ok_or_else(|| anyhow!(".cli-flags.toml path is not UTF-8"))?;
+    let parser = BundledFlags2Env::new();
+    parser
+        .audit_config(Some(config_path_text))
+        .map_err(|error| anyhow!(error.to_string()))?;
+
+    let argv = env::args().collect::<Vec<_>>();
+    let parsed = parser
+        .parse_structured(&argv, Some(config_path_text))
+        .map_err(|error| anyhow!(error.to_string()))?;
+    if !parsed.unknown_options.is_empty() {
+        bail!(
+            "unknown command-line options: {}",
+            parsed.unknown_options.len()
+        );
+    }
+    if !parsed.errors.is_empty() {
+        bail!("invalid command-line values: {}", parsed.errors.join("; "));
+    }
+    if !parsed.extras.is_empty() {
+        bail!("unexpected positional arguments: {}", parsed.extras.len());
+    }
+
+    let mut raw = env::vars().collect::<HashMap<_, _>>();
+    raw.extend(parsed.provided_flags);
+    let raw_config = parser
+        .coerce::<CliConfig, _>(&raw, Some(config_path_text))
+        .map_err(|error| anyhow!(error.to_string()))?;
+
+    let addr = parse_loopback_addr(&raw_config.GS_DESKTOP_ADDR)?;
+    let java_command = raw_config.GS_JAVA_COMMAND.trim().to_owned();
+    if java_command.is_empty() {
+        bail!("GS_JAVA_COMMAND may not be empty");
+    }
+    let main_class = raw_config.GS_CELL_MAIN_CLASS.trim().to_owned();
+    if main_class.is_empty()
+        || main_class.len() > 512
+        || !main_class
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'$'))
+    {
+        bail!("GS_CELL_MAIN_CLASS is invalid");
+    }
+    let artifact_root = match raw_config.GS_ARTIFACT_ROOT {
+        Some(path) if !path.trim().is_empty() => expand_home(Path::new(&path))?,
+        _ => default_artifact_root()?,
+    };
+    let max_cell_invocations = u64::try_from(raw_config.GS_MAX_CELL_INVOCATIONS)
+        .ok()
+        .filter(|value| *value > 0 && *value <= MAX_CELL_INVOCATIONS)
+        .ok_or_else(|| {
+            anyhow!("GS_MAX_CELL_INVOCATIONS must be between 1 and {MAX_CELL_INVOCATIONS}")
+        })?;
+    let token_path = match raw_config.GS_DESKTOP_TOKEN_FILE {
+        Some(path) if !path.trim().is_empty() => expand_home(Path::new(&path))?,
+        _ => default_token_path()?,
+    };
+
+    return Ok(RuntimeConfig {
+        addr,
+        java_command,
+        main_class,
+        artifact_root,
+        max_cell_invocations,
+        token_path,
+        log_filter: raw_config.GS_DESKTOP_LOG,
+    });
 }
 
 async fn health() -> &'static str {
@@ -142,14 +251,60 @@ async fn status(
     let live_cells = state.cells.lock().await.len();
     return Ok(Json(StatusResponse {
         runtime: "graalvm_jvm",
-        actor_reusable: false,
+        logical_actor_reusable: false,
+        jvm_cell_reusable: true,
         cell_reuse_scope: "same_tenant_generation",
+        config_source: "flags-2-env",
         uptime_ms: state.started_at.elapsed().as_millis(),
         accepted: state.accepted.load(Ordering::Relaxed),
         completed: state.completed.load(Ordering::Relaxed),
+        failed: state.failed.load(Ordering::Relaxed),
         live_cells,
         max_cell_invocations: state.max_cell_invocations,
     }));
+}
+
+async fn list_cells(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<CellStatus>>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
+    let cells = {
+        let cells = state.cells.lock().await;
+        cells
+            .iter()
+            .map(|(key, cell)| (key.clone(), cell.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    let mut statuses = Vec::with_capacity(cells.len());
+    for (key, cell) in cells {
+        let mut cell = cell.lock().await;
+        let running = cell.child.try_wait().map_err(internal_error)?.is_none();
+        statuses.push(CellStatus {
+            tenant_id: key.tenant_id,
+            deployment_id: key.deployment_id,
+            invocation_count: cell.invocation_count,
+            running,
+        });
+    }
+    return Ok(Json(statuses));
+}
+
+async fn retire_cell_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((tenant_id, deployment_id)): AxumPath<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
+    validate_identifier("tenant_id", &tenant_id)?;
+    validate_identifier("deployment_id", &deployment_id)?;
+    let key = CellKey {
+        tenant_id,
+        deployment_id,
+    };
+    let retired = retire_cell(&state, &key).await;
+    return Ok(Json(json!({ "retired": retired })));
 }
 
 async fn invoke(
@@ -178,6 +333,9 @@ async fn invoke(
     let cell = ensure_cell(&state, &key).await.map_err(internal_error)?;
     let result = invoke_cell(&cell, &request, Duration::from_millis(timeout_ms)).await;
     state.completed.fetch_add(1, Ordering::Relaxed);
+    if result.is_err() {
+        state.failed.fetch_add(1, Ordering::Relaxed);
+    }
 
     let retire = match &result {
         Ok(_) => {
@@ -187,7 +345,7 @@ async fn invoke(
         Err(_) => true,
     };
     if retire {
-        retire_cell(&state, &key).await;
+        let _ = retire_cell(&state, &key).await;
     }
 
     let response = match result {
@@ -206,13 +364,19 @@ async fn invoke(
             error: Some(error.to_string()),
         },
     };
-
     return Ok(Json(response));
 }
 
 async fn ensure_cell(state: &AppState, key: &CellKey) -> Result<Arc<Mutex<Cell>>> {
     if let Some(cell) = state.cells.lock().await.get(key).cloned() {
-        return Ok(cell);
+        let running = {
+            let mut guard = cell.lock().await;
+            guard.child.try_wait()?.is_none()
+        };
+        if running {
+            return Ok(cell);
+        }
+        let _ = retire_cell(state, key).await;
     }
 
     let artifact = artifact_path(&state.artifact_root, key, "gs-lambda-cell.jar")?;
@@ -226,16 +390,25 @@ async fn ensure_cell(state: &AppState, key: &CellKey) -> Result<Arc<Mutex<Cell>>
         .arg(state.main_class.as_ref())
         .env("GS_TENANT_ID", &key.tenant_id)
         .env("GS_DEPLOYMENT_ID", &key.deployment_id)
-        .env("GS_MAX_CELL_INVOCATIONS", state.max_cell_invocations.to_string())
+        .env(
+            "GS_MAX_CELL_INVOCATIONS",
+            state.max_cell_invocations.to_string(),
+        )
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to start {}", state.java_command))?;
 
-    let stdin = child.stdin.take().ok_or_else(|| anyhow!("JVM cell stdin unavailable"))?;
-    let stdout = child.stdout.take().ok_or_else(|| anyhow!("JVM cell stdout unavailable"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("JVM cell stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("JVM cell stdout unavailable"))?;
     let cell = Arc::new(Mutex::new(Cell {
         child,
         stdin,
@@ -274,13 +447,13 @@ async fn invoke_cell(
     let mut response_line = String::new();
     let bytes_read = timeout(deadline, cell.stdout.read_line(&mut response_line))
         .await
-        .map_err(|_| anyhow!("invocation timed out"))??;
+        .map_err(|_| anyhow!("logical actor invocation timed out; JVM cell will be retired"))??;
     if bytes_read == 0 {
         bail!("JVM cell closed its output");
     }
 
-    let response: Value = serde_json::from_str(response_line.trim())
-        .context("JVM cell returned invalid JSON")?;
+    let response: Value =
+        serde_json::from_str(response_line.trim()).context("JVM cell returned invalid JSON")?;
     if response.get("ok").and_then(Value::as_bool) != Some(true) {
         let message = response
             .get("error")
@@ -293,12 +466,14 @@ async fn invoke_cell(
     return Ok(response.get("payload").cloned().unwrap_or(Value::Null));
 }
 
-async fn retire_cell(state: &AppState, key: &CellKey) {
+async fn retire_cell(state: &AppState, key: &CellKey) -> bool {
     let cell = state.cells.lock().await.remove(key);
     if let Some(cell) = cell {
         let mut cell = cell.lock().await;
         let _ = cell.child.kill().await;
+        return true;
     }
+    return false;
 }
 
 async fn terminate_all_cells(state: &AppState) {
@@ -315,7 +490,10 @@ async fn terminate_all_cells(state: &AppState) {
 fn artifact_path(root: &Path, key: &CellKey, filename: &str) -> Result<PathBuf> {
     validate_path_component(&key.tenant_id)?;
     validate_path_component(&key.deployment_id)?;
-    return Ok(root.join(&key.tenant_id).join(&key.deployment_id).join(filename));
+    return Ok(root
+        .join(&key.tenant_id)
+        .join(&key.deployment_id)
+        .join(filename));
 }
 
 fn validate_path_component(value: &str) -> Result<()> {
@@ -351,7 +529,9 @@ fn validate_identifier(name: &str, value: &str) -> Result<(), (StatusCode, Strin
 }
 
 fn parse_loopback_addr(value: &str) -> Result<SocketAddr> {
-    let addr: SocketAddr = value.parse().context("GS_DESKTOP_ADDR is not a socket address")?;
+    let addr: SocketAddr = value
+        .parse()
+        .context("GS_DESKTOP_ADDR is not a socket address")?;
     if !is_loopback(addr.ip()) {
         bail!("GS_DESKTOP_ADDR must bind to loopback");
     }
@@ -362,63 +542,154 @@ fn is_loopback(ip: IpAddr) -> bool {
     return ip.is_loopback();
 }
 
-fn positive_u64_env(name: &str, default_value: u64) -> Result<u64> {
-    let Some(raw) = env::var(name).ok() else {
-        return Ok(default_value);
-    };
-    let value = raw.parse::<u64>().with_context(|| format!("{name} must be an integer"))?;
-    if value == 0 {
-        bail!("{name} must be greater than zero");
+fn resolve_config_path() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("GS_DESKTOP_FLAGS_CONFIG") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        bail!("GS_DESKTOP_FLAGS_CONFIG is not a readable file");
     }
-    return Ok(value);
+    let current = env::current_dir()?.join(".cli-flags.toml");
+    if current.is_file() {
+        return Ok(current);
+    }
+    let executable = env::current_exe()?;
+    if let Some(parent) = executable.parent() {
+        let adjacent = parent.join(".cli-flags.toml");
+        if adjacent.is_file() {
+            return Ok(adjacent);
+        }
+    }
+    bail!("cannot locate .cli-flags.toml");
 }
 
-fn artifact_root() -> Result<PathBuf> {
-    if let Ok(path) = env::var("GS_ARTIFACT_ROOT") {
-        return expand_home(Path::new(&path));
-    }
-    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is required"))?;
+fn default_artifact_root() -> Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .ok_or_else(|| anyhow!("HOME or USERPROFILE is required"))?;
     return Ok(PathBuf::from(home).join(".graal-show/artifacts"));
 }
 
-fn token_path() -> Result<PathBuf> {
-    if let Ok(path) = env::var("GS_DESKTOP_TOKEN_FILE") {
-        return expand_home(Path::new(&path));
-    }
-    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is required"))?;
+fn default_token_path() -> Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .ok_or_else(|| anyhow!("HOME or USERPROFILE is required"))?;
     return Ok(PathBuf::from(home).join(".graal-show/daemon/token"));
 }
 
 fn expand_home(path: &Path) -> Result<PathBuf> {
     let text = path.to_string_lossy();
     if text == "~" || text.starts_with("~/") {
-        let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is required"))?;
+        let home = env::var_os("HOME")
+            .or_else(|| env::var_os("USERPROFILE"))
+            .ok_or_else(|| anyhow!("HOME or USERPROFILE is required"))?;
         let suffix = text.trim_start_matches('~').trim_start_matches('/');
         return Ok(PathBuf::from(home).join(suffix));
     }
     return Ok(path.to_path_buf());
 }
 
-fn load_or_create_token(path: &Path) -> Result<String> {
-    if let Ok(token) = std::fs::read_to_string(path) {
-        let token = token.trim();
-        if token.len() >= 32 {
-            return Ok(token.to_owned());
-        }
-        bail!("desktop daemon token file is too short");
+fn validate_token_file_metadata(metadata: &std::fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        bail!("desktop daemon token path may not be a symlink");
     }
-
-    let parent = path.parent().ok_or_else(|| anyhow!("token path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    std::fs::write(path, format!("{token}\n"))?;
+    if !metadata.is_file() {
+        bail!("desktop daemon token path must be a regular file");
+    }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            bail!("desktop daemon token file must use owner-only mode 0600");
+        }
+    }
+    return Ok(());
+}
+
+fn read_existing_token(path: &Path) -> Result<Option<String>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot inspect desktop daemon token file {}",
+                    path.display()
+                )
+            });
+        }
+    };
+    validate_token_file_metadata(&metadata)?;
+
+    let token = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read desktop daemon token file {}", path.display()))?;
+    let token = token.trim();
+    if token.len() < 32 || token.chars().any(char::is_whitespace) {
+        bail!("desktop daemon token file is malformed");
+    }
+    return Ok(Some(token.to_owned()));
+}
+
+fn load_or_create_token(path: &Path) -> Result<String> {
+    if let Some(token) = read_existing_token(path)? {
+        return Ok(token);
     }
 
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("token path has no parent"))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("cannot create token directory {}", parent.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("cannot secure token directory {}", parent.display()))?;
+    }
+
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    use std::io::Write as _;
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(format!("{token}\n").as_bytes())
+                .with_context(|| {
+                    format!("cannot write desktop daemon token file {}", path.display())
+                })?;
+            file.sync_all().with_context(|| {
+                format!("cannot sync desktop daemon token file {}", path.display())
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return read_existing_token(path)?.ok_or_else(|| {
+                anyhow!("desktop daemon token file appeared but could not be read")
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("cannot create desktop daemon token file {}", path.display())
+            });
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "cannot inspect new desktop daemon token file {}",
+            path.display()
+        )
+    })?;
+    validate_token_file_metadata(&metadata)?;
     return Ok(token);
 }
 
@@ -428,4 +699,35 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_loopback_bind() {
+        assert!(parse_loopback_addr("127.0.0.1:8764").is_ok());
+        assert!(parse_loopback_addr("0.0.0.0:8764").is_err());
+    }
+
+    #[test]
+    fn deployment_key_rejects_path_traversal() {
+        assert!(validate_path_component("deployment-1").is_ok());
+        assert!(validate_path_component("..").is_err());
+        assert!(validate_path_component("tenant/escape").is_err());
+    }
+
+    #[test]
+    fn artifact_path_is_tenant_and_generation_scoped() {
+        let root = PathBuf::from("/tmp/graal-show");
+        let key = CellKey {
+            tenant_id: "tenant-a".to_owned(),
+            deployment_id: "deploy-123".to_owned(),
+        };
+        let valid = artifact_path(&root, &key, "gs-lambda-cell.jar")
+            .map(|path| path.ends_with("tenant-a/deploy-123/gs-lambda-cell.jar"))
+            .unwrap_or(false);
+        assert!(valid);
+    }
 }

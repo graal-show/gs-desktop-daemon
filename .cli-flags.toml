@@ -1,0 +1,54 @@
+[help]
+url = "https://github.com/graal-show/gs-desktop-daemon"
+columns = ["options", "env", "type", "default", "description"]
+
+[parse]
+stop_at_first_positional = false
+allow_unknown = false
+
+[flags.listen]
+env = "GS_DESKTOP_ADDR"
+aliases = ["listen"]
+type = "string"
+default = "127.0.0.1:8764"
+help = "Loopback listen address for the desktop daemon."
+
+[flags.java]
+env = "GS_JAVA_COMMAND"
+aliases = ["java"]
+type = "string"
+default = "java"
+help = "Allowlisted Java/Graal runtime executable."
+
+[flags.main-class]
+env = "GS_CELL_MAIN_CLASS"
+aliases = ["main-class"]
+type = "string"
+default = "dev.graalshow.lambda.CellMain"
+help = "Pinned JVM cell main class."
+
+[flags.artifact-root]
+env = "GS_ARTIFACT_ROOT"
+aliases = ["artifact-root"]
+type = "string"
+help = "Root containing tenant/deployment gs-lambda-cell.jar artifacts."
+
+[flags.max-cell-invocations]
+env = "GS_MAX_CELL_INVOCATIONS"
+aliases = ["max-cell-invocations"]
+type = "integer"
+default = 1000
+help = "Maximum successful logical actor invocations before retiring a reusable JVM cell."
+
+[flags.token-file]
+env = "GS_DESKTOP_TOKEN_FILE"
+aliases = ["token-file"]
+type = "string"
+help = "Optional local bearer-token file path; token values are never argv."
+
+[flags.log]
+env = "GS_DESKTOP_LOG"
+aliases = ["log"]
+type = "string"
+default = "gs_desktop_daemon=info"
+help = "Tracing filter for the desktop daemon."
