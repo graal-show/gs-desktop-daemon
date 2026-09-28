@@ -590,27 +590,106 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
     return Ok(path.to_path_buf());
 }
 
-fn load_or_create_token(path: &Path) -> Result<String> {
-    if let Ok(token) = std::fs::read_to_string(path) {
-        let token = token.trim();
-        if token.len() >= 32 && !token.chars().any(char::is_whitespace) {
-            return Ok(token.to_owned());
+fn validate_token_file_metadata(metadata: &std::fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        bail!("desktop daemon token path may not be a symlink");
+    }
+    if !metadata.is_file() {
+        bail!("desktop daemon token path must be a regular file");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            bail!("desktop daemon token file must use owner-only mode 0600");
         }
+    }
+    return Ok(());
+}
+
+fn read_existing_token(path: &Path) -> Result<Option<String>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot inspect desktop daemon token file {}",
+                    path.display()
+                )
+            });
+        }
+    };
+    validate_token_file_metadata(&metadata)?;
+
+    let token = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read desktop daemon token file {}", path.display()))?;
+    let token = token.trim();
+    if token.len() < 32 || token.chars().any(char::is_whitespace) {
         bail!("desktop daemon token file is malformed");
+    }
+    return Ok(Some(token.to_owned()));
+}
+
+fn load_or_create_token(path: &Path) -> Result<String> {
+    if let Some(token) = read_existing_token(path)? {
+        return Ok(token);
     }
 
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("token path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    std::fs::write(path, format!("{token}\n"))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("cannot create token directory {}", parent.display()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("cannot secure token directory {}", parent.display()))?;
     }
+
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    use std::io::Write as _;
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(format!("{token}\n").as_bytes())
+                .with_context(|| {
+                    format!("cannot write desktop daemon token file {}", path.display())
+                })?;
+            file.sync_all().with_context(|| {
+                format!("cannot sync desktop daemon token file {}", path.display())
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return read_existing_token(path)?.ok_or_else(|| {
+                anyhow!("desktop daemon token file appeared but could not be read")
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("cannot create desktop daemon token file {}", path.display())
+            });
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "cannot inspect new desktop daemon token file {}",
+            path.display()
+        )
+    })?;
+    validate_token_file_metadata(&metadata)?;
     return Ok(token);
 }
 
