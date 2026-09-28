@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::{
     error::Error,
     fs,
@@ -47,7 +49,6 @@ fn stderr_text(output: &std::process::Output) -> String {
     return String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
 }
 
-#[cfg(unix)]
 #[test]
 fn rejects_existing_token_with_group_or_world_access() -> Result<(), Box<dyn Error>> {
     use std::os::unix::fs::PermissionsExt;
@@ -72,7 +73,6 @@ fn rejects_existing_token_with_group_or_world_access() -> Result<(), Box<dyn Err
     return Ok(());
 }
 
-#[cfg(unix)]
 #[test]
 fn rejects_symlink_token_path() -> Result<(), Box<dyn Error>> {
     use std::os::unix::fs::{PermissionsExt, symlink};
