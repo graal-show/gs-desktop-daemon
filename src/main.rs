@@ -349,7 +349,9 @@ async fn invoke(
         tenant_id: request.tenant_id.clone(),
         deployment_id: request.deployment_id.clone(),
     };
-    let cell = ensure_cell(&state, &key).await.map_err(service_unavailable)?;
+    let cell = ensure_cell(&state, &key)
+        .await
+        .map_err(service_unavailable)?;
     let result = invoke_cell(&cell, &request, Duration::from_millis(timeout_ms)).await;
     state.completed.fetch_add(1, Ordering::Relaxed);
     if result.is_err() {
@@ -403,11 +405,9 @@ async fn ensure_cell(state: &AppState, key: &CellKey) -> Result<Arc<Mutex<Cell>>
         bail!("JVM cell artifact is missing for the requested deployment");
     }
 
-    let live_permit = state
-        .cell_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| anyhow!("live JVM cell limit reached; retire an idle cell before cold start"))?;
+    let live_permit = state.cell_slots.clone().try_acquire_owned().map_err(|_| {
+        anyhow!("live JVM cell limit reached; retire an idle cell before cold start")
+    })?;
 
     let mut child = Command::new(state.java_command.as_ref())
         .arg("-cp")
