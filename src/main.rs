@@ -42,7 +42,7 @@ struct CliConfig {
     GS_CELL_MAIN_CLASS: String,
     GS_ARTIFACT_ROOT: Option<String>,
     GS_MAX_CELL_INVOCATIONS: i64,
-    GS_MAX_LIVE_CELLS: i64,
+    GS_MAX_LIVE_CELLS: i64,\n    GS_TENANT_ISOLATE_POOL_SIZE: i64,
     GS_DESKTOP_TOKEN_FILE: Option<String>,
     GS_DESKTOP_LOG: String,
 }
@@ -54,7 +54,7 @@ struct RuntimeConfig {
     main_class: String,
     artifact_root: PathBuf,
     max_cell_invocations: u64,
-    max_live_cells: usize,
+    max_live_cells: usize,\n    pool_size: usize,
     token_path: PathBuf,
     log_filter: String,
 }
@@ -73,6 +73,11 @@ struct Cell {
     _live_permit: OwnedSemaphorePermit,
 }
 
+struct CellPool {
+    cells: Vec<Arc<Mutex<Cell>>>,
+    next: AtomicU64,
+}
+
 #[derive(Clone)]
 struct AppState {
     token: Arc<str>,
@@ -82,7 +87,7 @@ struct AppState {
     max_cell_invocations: u64,
     max_live_cells: usize,
     cell_slots: Arc<Semaphore>,
-    cells: Arc<Mutex<HashMap<CellKey, Arc<Mutex<Cell>>>>>,
+    pools: Arc<Mutex<HashMap<CellKey, Arc<CellPool>>>>,\n    pool_size: usize,
     started_at: Instant,
     accepted: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
@@ -122,7 +127,7 @@ struct StatusResponse {
     live_cells: usize,
     max_cell_invocations: u64,
     max_live_cells: usize,
-    available_cell_slots: usize,
+    available_cell_slots: usize,\n    tenant_isolate_pool_size: usize,\n    live_generation_pools: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,7 +135,7 @@ struct CellStatus {
     tenant_id: String,
     deployment_id: String,
     invocation_count: u64,
-    running: bool,
+    running: bool,\n    cell_index: usize,
 }
 
 #[tokio::main]
@@ -149,7 +154,7 @@ async fn main() -> Result<()> {
         max_cell_invocations: config.max_cell_invocations,
         max_live_cells: config.max_live_cells,
         cell_slots: Arc::new(Semaphore::new(config.max_live_cells)),
-        cells: Arc::new(Mutex::new(HashMap::new())),
+        pools: Arc::new(Mutex::new(HashMap::new())),\n        pool_size: config.pool_size,
         started_at: Instant::now(),
         accepted: Arc::new(AtomicU64::new(0)),
         completed: Arc::new(AtomicU64::new(0)),
@@ -239,6 +244,13 @@ fn load_config() -> Result<RuntimeConfig> {
         .ok()
         .filter(|value| *value > 0 && *value <= MAX_LIVE_CELLS)
         .ok_or_else(|| anyhow!("GS_MAX_LIVE_CELLS must be between 1 and {MAX_LIVE_CELLS}"))?;
+    let pool_size = usize::try_from(raw_config.GS_TENANT_ISOLATE_POOL_SIZE)
+        .ok()
+        .filter(|value| *value > 0 && *value <= 16)
+        .ok_or_else(|| anyhow!("GS_TENANT_ISOLATE_POOL_SIZE must be between 1 and 16"))?;
+    if pool_size > max_live_cells {
+        bail!("GS_TENANT_ISOLATE_POOL_SIZE may not exceed GS_MAX_LIVE_CELLS");
+    }
     let token_path = match raw_config.GS_DESKTOP_TOKEN_FILE {
         Some(path) if !path.trim().is_empty() => expand_home(Path::new(&path))?,
         _ => default_token_path()?,
@@ -265,7 +277,10 @@ async fn status(
     headers: HeaderMap,
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
     authorize(&headers, &state)?;
-    let live_cells = state.cells.lock().await.len();
+    let pools = state.pools.lock().await;
+    let live_generation_pools = pools.len();
+    let live_cells = pools.values().map(|pool| pool.cells.len()).sum();
+    drop(pools);
     return Ok(Json(StatusResponse {
         runtime: "graalvm_jvm",
         logical_actor_reusable: false,
@@ -280,6 +295,8 @@ async fn status(
         max_cell_invocations: state.max_cell_invocations,
         max_live_cells: state.max_live_cells,
         available_cell_slots: state.cell_slots.available_permits(),
+        tenant_isolate_pool_size: state.pool_size,
+        live_generation_pools,
     }));
 }
 
@@ -288,26 +305,25 @@ async fn list_cells(
     headers: HeaderMap,
 ) -> Result<Json<Vec<CellStatus>>, (StatusCode, String)> {
     authorize(&headers, &state)?;
-    let cells = {
-        let cells = state.cells.lock().await;
-        cells
-            .iter()
-            .map(|(key, cell)| (key.clone(), cell.clone()))
-            .collect::<Vec<_>>()
+    let pools = {
+        let pools = state.pools.lock().await;
+        pools.iter().map(|(key, pool)| (key.clone(), pool.clone())).collect::<Vec<_>>()
     };
-
-    let mut statuses = Vec::with_capacity(cells.len());
-    for (key, cell) in cells {
-        let mut cell = cell.lock().await;
-        let running = cell.child.try_wait().map_err(internal_error)?.is_none();
-        statuses.push(CellStatus {
-            tenant_id: key.tenant_id,
-            deployment_id: key.deployment_id,
-            invocation_count: cell.invocation_count,
-            running,
-        });
+    let mut statuses = Vec::new();
+    for (key, pool) in pools {
+        for (cell_index, cell) in pool.cells.iter().enumerate() {
+            let mut cell = cell.lock().await;
+            let running = cell.child.try_wait().map_err(internal_error)?.is_none();
+            statuses.push(CellStatus {
+                tenant_id: key.tenant_id.clone(),
+                deployment_id: key.deployment_id.clone(),
+                invocation_count: cell.invocation_count,
+                running,
+                cell_index,
+            });
+        }
     }
-    return Ok(Json(statuses));
+    Ok(Json(statuses))
 }
 
 async fn retire_cell_route(
@@ -322,7 +338,7 @@ async fn retire_cell_route(
         tenant_id,
         deployment_id,
     };
-    let retired = retire_cell(&state, &key).await;
+    let retired = retire_pool(&state, &key).await;
     return Ok(Json(json!({ "retired": retired })));
 }
 
@@ -338,10 +354,8 @@ async fn invoke(
 
     let timeout_ms = request.timeout_ms.unwrap_or(30_000);
     if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"),
-        ));
+        return Err((StatusCode::BAD_REQUEST,
+            format!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS}")));
     }
 
     state.accepted.fetch_add(1, Ordering::Relaxed);
@@ -349,9 +363,9 @@ async fn invoke(
         tenant_id: request.tenant_id.clone(),
         deployment_id: request.deployment_id.clone(),
     };
-    let cell = ensure_cell(&state, &key)
-        .await
-        .map_err(service_unavailable)?;
+    let pool = ensure_pool(&state, &key).await.map_err(service_unavailable)?;
+    let index = (pool.next.fetch_add(1, Ordering::Relaxed) as usize) % pool.cells.len();
+    let cell = pool.cells[index].clone();
     let result = invoke_cell(&cell, &request, Duration::from_millis(timeout_ms)).await;
     state.completed.fetch_add(1, Ordering::Relaxed);
     if result.is_err() {
@@ -359,14 +373,11 @@ async fn invoke(
     }
 
     let retire = match &result {
-        Ok(_) => {
-            let guard = cell.lock().await;
-            guard.invocation_count >= state.max_cell_invocations
-        }
+        Ok(_) => cell.lock().await.invocation_count >= state.max_cell_invocations,
         Err(_) => true,
     };
     if retire {
-        let _ = retire_cell(&state, &key).await;
+        let _ = retire_pool(&state, &key).await;
     }
 
     let response = match result {
@@ -385,73 +396,61 @@ async fn invoke(
             error: Some(error.to_string()),
         },
     };
-    return Ok(Json(response));
+    Ok(Json(response))
 }
 
-async fn ensure_cell(state: &AppState, key: &CellKey) -> Result<Arc<Mutex<Cell>>> {
-    if let Some(cell) = state.cells.lock().await.get(key).cloned() {
-        let running = {
-            let mut guard = cell.lock().await;
-            guard.child.try_wait()?.is_none()
-        };
-        if running {
-            return Ok(cell);
-        }
-        let _ = retire_cell(state, key).await;
+async fn ensure_pool(state: &AppState, key: &CellKey) -> Result<Arc<CellPool>> {
+    if let Some(pool) = state.pools.lock().await.get(key).cloned() {
+        return Ok(pool);
     }
 
+    let mut cells = Vec::with_capacity(state.pool_size);
+    for _ in 0..state.pool_size {
+        match spawn_cell(state, key).await {
+            Ok(cell) => cells.push(Arc::new(Mutex::new(cell))),
+            Err(error) => {
+                for cell in cells {
+                    let mut cell = cell.lock().await;
+                    let _ = cell.child.kill().await;
+                    let _ = cell.child.wait().await;
+                }
+                return Err(error);
+            }
+        }
+    }
+    let pool = Arc::new(CellPool { cells, next: AtomicU64::new(0) });
+    let mut pools = state.pools.lock().await;
+    Ok(pools.entry(key.clone()).or_insert_with(|| pool.clone()).clone())
+}
+
+async fn spawn_cell(state: &AppState, key: &CellKey) -> Result<Cell> {
     let artifact = artifact_path(&state.artifact_root, key, "gs-lambda-cell.jar")?;
     if !artifact.is_file() {
         bail!("JVM cell artifact is missing for the requested deployment");
     }
-
     let live_permit = state.cell_slots.clone().try_acquire_owned().map_err(|_| {
-        anyhow!("live JVM cell limit reached; retire an idle cell before cold start")
+        anyhow!("live JVM cell limit reached; retire an idle pool before cold start")
     })?;
-
     let mut child = Command::new(state.java_command.as_ref())
-        .arg("-cp")
-        .arg(&artifact)
-        .arg(state.main_class.as_ref())
+        .arg("-cp").arg(&artifact).arg(state.main_class.as_ref())
         .env("GS_TENANT_ID", &key.tenant_id)
         .env("GS_DEPLOYMENT_ID", &key.deployment_id)
-        .env(
-            "GS_MAX_CELL_INVOCATIONS",
-            state.max_cell_invocations.to_string(),
-        )
+        .env("GS_MAX_CELL_INVOCATIONS", state.max_cell_invocations.to_string())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to start {}", state.java_command))?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("JVM cell stdin unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("JVM cell stdout unavailable"))?;
-    let cell = Arc::new(Mutex::new(Cell {
+    let stdin = child.stdin.take().ok_or_else(|| anyhow!("JVM cell stdin unavailable"))?;
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("JVM cell stdout unavailable"))?;
+    Ok(Cell {
         child,
         stdin,
         stdout: BufReader::new(stdout),
         invocation_count: 0,
         _live_permit: live_permit,
-    }));
-
-    let mut cells = state.cells.lock().await;
-    if let Some(existing) = cells.get(key).cloned() {
-        drop(cells);
-        let mut unused = cell.lock().await;
-        let _ = unused.child.kill().await;
-        let _ = unused.child.wait().await;
-        return Ok(existing);
-    }
-    cells.insert(key.clone(), cell.clone());
-    return Ok(cell);
+    })
 }
 
 async fn invoke_cell(
@@ -460,6 +459,9 @@ async fn invoke_cell(
     deadline: Duration,
 ) -> Result<Value> {
     let mut cell = cell.lock().await;
+    if cell.child.try_wait()?.is_some() {
+        bail!("JVM isolate cell exited before invocation");
+    }
     let envelope = json!({
         "invocation_id": request.invocation_id,
         "tenant_id": request.tenant_id,
@@ -471,28 +473,21 @@ async fn invoke_cell(
     cell.stdin.write_all(&line).await?;
     cell.stdin.flush().await?;
 
-    let response_line = timeout(
-        deadline,
-        read_bounded_line(&mut cell.stdout, MAX_CELL_RESPONSE_BYTES),
-    )
-    .await
-    .map_err(|_| anyhow!("logical actor invocation timed out; JVM cell will be retired"))??;
+    let response_line = timeout(deadline,
+        read_bounded_line(&mut cell.stdout, MAX_CELL_RESPONSE_BYTES))
+        .await
+        .map_err(|_| anyhow!("logical invocation timed out; isolate pool will be retired"))??;
     if response_line.is_empty() {
-        bail!("JVM cell closed its output");
+        bail!("JVM isolate cell closed its output");
     }
-
-    let response: Value =
-        serde_json::from_slice(&response_line).context("JVM cell returned invalid JSON")?;
+    let response: Value = serde_json::from_slice(&response_line)
+        .context("JVM isolate cell returned invalid JSON")?;
     if response.get("ok").and_then(Value::as_bool) != Some(true) {
-        let message = response
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("JVM actor invocation failed");
-        bail!("{message}");
+        bail!("{}", response.get("error").and_then(Value::as_str)
+            .unwrap_or("JVM isolate invocation failed"));
     }
-
     cell.invocation_count = cell.invocation_count.saturating_add(1);
-    return Ok(response.get("payload").cloned().unwrap_or(Value::Null));
+    Ok(response.get("payload").cloned().unwrap_or(Value::Null))
 }
 
 async fn read_bounded_line(
@@ -530,26 +525,30 @@ async fn read_bounded_line(
     }
 }
 
-async fn retire_cell(state: &AppState, key: &CellKey) -> bool {
-    let cell = state.cells.lock().await.remove(key);
-    if let Some(cell) = cell {
-        let mut cell = cell.lock().await;
-        let _ = cell.child.kill().await;
-        let _ = cell.child.wait().await;
+async fn retire_pool(state: &AppState, key: &CellKey) -> bool {
+    let pool = state.pools.lock().await.remove(key);
+    if let Some(pool) = pool {
+        for cell in &pool.cells {
+            let mut cell = cell.lock().await;
+            let _ = cell.child.kill().await;
+            let _ = cell.child.wait().await;
+        }
         return true;
     }
-    return false;
+    false
 }
 
 async fn terminate_all_cells(state: &AppState) {
-    let cells = {
-        let mut map = state.cells.lock().await;
-        map.drain().map(|(_, cell)| cell).collect::<Vec<_>>()
+    let pools = {
+        let mut map = state.pools.lock().await;
+        map.drain().map(|(_, pool)| pool).collect::<Vec<_>>()
     };
-    for cell in cells {
-        let mut cell = cell.lock().await;
-        let _ = cell.child.kill().await;
-        let _ = cell.child.wait().await;
+    for pool in pools {
+        for cell in &pool.cells {
+            let mut cell = cell.lock().await;
+            let _ = cell.child.kill().await;
+            let _ = cell.child.wait().await;
+        }
     }
 }
 
