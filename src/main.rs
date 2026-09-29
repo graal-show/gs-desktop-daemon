@@ -263,6 +263,7 @@ fn load_config() -> Result<RuntimeConfig> {
         artifact_root,
         max_cell_invocations,
         max_live_cells,
+        pool_size,
         token_path,
         log_filter: raw_config.GS_DESKTOP_LOG,
     });
