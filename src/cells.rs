@@ -313,7 +313,10 @@ impl CellPool {
         let artifact_dir = artifact_dir(&self.inner.config.artifact_root, &key)?;
         let jar = artifact_dir.join("gs-lambda-cell.jar");
         require_regular_file(&jar, "Graal cell JAR")?;
-        require_regular_file(&artifact_dir.join("manifest.json"), "Graal deployment manifest")?;
+        require_regular_file(
+            &artifact_dir.join("manifest.json"),
+            "Graal deployment manifest",
+        )?;
 
         let mut child = Command::new(&self.inner.config.java_command)
             .arg("-cp")
