@@ -47,6 +47,13 @@ type = "integer"
 default = 64
 help = "Maximum simultaneously resident tenant+deployment JVM cells. Capacity is reserved before JVM spawn."
 
+[flags.tenant-isolate-pool-size]
+env = "GS_TENANT_ISOLATE_POOL_SIZE"
+aliases = ["tenant-isolate-pool-size"]
+type = "integer"
+default = 3
+help = "Warm isolate/JVM cells per tenant+deployment generation on this box."
+
 [flags.token-file]
 env = "GS_DESKTOP_TOKEN_FILE"
 aliases = ["token-file"]
