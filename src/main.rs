@@ -257,15 +257,10 @@ fn load_config() -> Result<RuntimeConfig> {
         MAX_TIMEOUT_MS,
     )?;
     let max_ast_depth = bounded_u32("GS_MAX_AST_DEPTH", raw_config.GS_MAX_AST_DEPTH, 100_000)?;
-    let max_guest_threads = bounded_u32(
-        "GS_MAX_GUEST_THREADS",
-        raw_config.GS_MAX_GUEST_THREADS,
-        64,
-    )?;
-    let max_isolate_memory = validate_memory_limit(
-        "GS_MAX_ISOLATE_MEMORY",
-        &raw_config.GS_MAX_ISOLATE_MEMORY,
-    )?;
+    let max_guest_threads =
+        bounded_u32("GS_MAX_GUEST_THREADS", raw_config.GS_MAX_GUEST_THREADS, 64)?;
+    let max_isolate_memory =
+        validate_memory_limit("GS_MAX_ISOLATE_MEMORY", &raw_config.GS_MAX_ISOLATE_MEMORY)?;
     let max_guest_heap_memory = validate_memory_limit(
         "GS_MAX_GUEST_HEAP_MEMORY",
         &raw_config.GS_MAX_GUEST_HEAP_MEMORY,
@@ -354,7 +349,9 @@ fn validate_memory_limit(name: &str, value: &str) -> Result<String> {
         .find(|suffix| value.ends_with(suffix))
         .ok_or_else(|| anyhow!("{name} must use KB, MB, or GB units"))?;
     let number = value.trim_end_matches(suffix);
-    if number.is_empty() || number.starts_with('0') || !number.bytes().all(|byte| byte.is_ascii_digit())
+    if number.is_empty()
+        || number.starts_with('0')
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
     {
         bail!("{name} must be a positive integer followed by {suffix}");
     }
@@ -422,7 +419,9 @@ async fn retire_generation_route(
             retired = retired.saturating_add(1);
         }
     }
-    return Ok(Json(json!({ "retired": retired > 0, "retired_cells": retired })));
+    return Ok(Json(
+        json!({ "retired": retired > 0, "retired_cells": retired }),
+    ));
 }
 
 async fn drain_cell_route(
