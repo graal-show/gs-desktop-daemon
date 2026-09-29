@@ -42,7 +42,8 @@ struct CliConfig {
     GS_CELL_MAIN_CLASS: String,
     GS_ARTIFACT_ROOT: Option<String>,
     GS_MAX_CELL_INVOCATIONS: i64,
-    GS_MAX_LIVE_CELLS: i64,\n    GS_TENANT_ISOLATE_POOL_SIZE: i64,
+    GS_MAX_LIVE_CELLS: i64,
+    GS_TENANT_ISOLATE_POOL_SIZE: i64,
     GS_DESKTOP_TOKEN_FILE: Option<String>,
     GS_DESKTOP_LOG: String,
 }
@@ -54,7 +55,8 @@ struct RuntimeConfig {
     main_class: String,
     artifact_root: PathBuf,
     max_cell_invocations: u64,
-    max_live_cells: usize,\n    pool_size: usize,
+    max_live_cells: usize,
+    pool_size: usize,
     token_path: PathBuf,
     log_filter: String,
 }
@@ -73,8 +75,13 @@ struct Cell {
     _live_permit: OwnedSemaphorePermit,
 }
 
+struct CellHandle {
+    cell: Mutex<Cell>,
+    slot: Arc<Semaphore>,
+}
+
 struct CellPool {
-    cells: Vec<Arc<Mutex<Cell>>>,
+    cells: Vec<Arc<CellHandle>>,
     next: AtomicU64,
 }
 
@@ -87,7 +94,8 @@ struct AppState {
     max_cell_invocations: u64,
     max_live_cells: usize,
     cell_slots: Arc<Semaphore>,
-    pools: Arc<Mutex<HashMap<CellKey, Arc<CellPool>>>>,\n    pool_size: usize,
+    pools: Arc<Mutex<HashMap<CellKey, Arc<CellPool>>>>,
+    pool_size: usize,
     started_at: Instant,
     accepted: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
@@ -116,8 +124,8 @@ struct InvocationResponse {
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     runtime: &'static str,
-    logical_actor_reusable: bool,
-    jvm_cell_reusable: bool,
+    request_context_reusable: bool,
+    engine_cell_reusable: bool,
     cell_reuse_scope: &'static str,
     config_source: &'static str,
     uptime_ms: u128,
@@ -125,9 +133,11 @@ struct StatusResponse {
     completed: u64,
     failed: u64,
     live_cells: usize,
+    live_generation_pools: usize,
     max_cell_invocations: u64,
     max_live_cells: usize,
-    available_cell_slots: usize,\n    tenant_isolate_pool_size: usize,\n    live_generation_pools: usize,
+    available_cell_slots: usize,
+    tenant_isolate_pool_size: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -135,7 +145,9 @@ struct CellStatus {
     tenant_id: String,
     deployment_id: String,
     invocation_count: u64,
-    running: bool,\n    cell_index: usize,
+    running: bool,
+    busy: bool,
+    cell_index: usize,
 }
 
 #[tokio::main]
@@ -154,7 +166,8 @@ async fn main() -> Result<()> {
         max_cell_invocations: config.max_cell_invocations,
         max_live_cells: config.max_live_cells,
         cell_slots: Arc::new(Semaphore::new(config.max_live_cells)),
-        pools: Arc::new(Mutex::new(HashMap::new())),\n        pool_size: config.pool_size,
+        pools: Arc::new(Mutex::new(HashMap::new())),
+        pool_size: config.pool_size,
         started_at: Instant::now(),
         accepted: Arc::new(AtomicU64::new(0)),
         completed: Arc::new(AtomicU64::new(0)),
@@ -198,10 +211,7 @@ fn load_config() -> Result<RuntimeConfig> {
         .parse_structured(&argv, Some(config_path_text))
         .map_err(|error| anyhow!(error.to_string()))?;
     if !parsed.unknown_options.is_empty() {
-        bail!(
-            "unknown command-line options: {}",
-            parsed.unknown_options.len()
-        );
+        bail!("unknown command-line options: {}", parsed.unknown_options.len());
     }
     if !parsed.errors.is_empty() {
         bail!("invalid command-line values: {}", parsed.errors.join("; "));
@@ -282,22 +292,23 @@ async fn status(
     let live_generation_pools = pools.len();
     let live_cells = pools.values().map(|pool| pool.cells.len()).sum();
     drop(pools);
+
     return Ok(Json(StatusResponse {
-        runtime: "graalvm_jvm",
-        logical_actor_reusable: false,
-        jvm_cell_reusable: true,
+        runtime: "graalvm_polyglot",
+        request_context_reusable: false,
+        engine_cell_reusable: true,
         cell_reuse_scope: "same_tenant_generation",
-        config_source: "flags-2-env",
+        config_source: "flags-2-env+deployment-manifest",
         uptime_ms: state.started_at.elapsed().as_millis(),
         accepted: state.accepted.load(Ordering::Relaxed),
         completed: state.completed.load(Ordering::Relaxed),
         failed: state.failed.load(Ordering::Relaxed),
         live_cells,
+        live_generation_pools,
         max_cell_invocations: state.max_cell_invocations,
         max_live_cells: state.max_live_cells,
         available_cell_slots: state.cell_slots.available_permits(),
         tenant_isolate_pool_size: state.pool_size,
-        live_generation_pools,
     }));
 }
 
@@ -308,23 +319,29 @@ async fn list_cells(
     authorize(&headers, &state)?;
     let pools = {
         let pools = state.pools.lock().await;
-        pools.iter().map(|(key, pool)| (key.clone(), pool.clone())).collect::<Vec<_>>()
+        pools
+            .iter()
+            .map(|(key, pool)| (key.clone(), pool.clone()))
+            .collect::<Vec<_>>()
     };
+
     let mut statuses = Vec::new();
     for (key, pool) in pools {
-        for (cell_index, cell) in pool.cells.iter().enumerate() {
-            let mut cell = cell.lock().await;
+        for (cell_index, handle) in pool.cells.iter().enumerate() {
+            let busy = handle.slot.available_permits() == 0;
+            let mut cell = handle.cell.lock().await;
             let running = cell.child.try_wait().map_err(internal_error)?.is_none();
             statuses.push(CellStatus {
                 tenant_id: key.tenant_id.clone(),
                 deployment_id: key.deployment_id.clone(),
                 invocation_count: cell.invocation_count,
                 running,
+                busy,
                 cell_index,
             });
         }
     }
-    Ok(Json(statuses))
+    return Ok(Json(statuses));
 }
 
 async fn retire_cell_route(
@@ -355,8 +372,10 @@ async fn invoke(
 
     let timeout_ms = request.timeout_ms.unwrap_or(30_000);
     if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
-        return Err((StatusCode::BAD_REQUEST,
-            format!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS}")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"),
+        ));
     }
 
     state.accepted.fetch_add(1, Ordering::Relaxed);
@@ -364,17 +383,30 @@ async fn invoke(
         tenant_id: request.tenant_id.clone(),
         deployment_id: request.deployment_id.clone(),
     };
-    let pool = ensure_pool(&state, &key).await.map_err(service_unavailable)?;
-    let index = (pool.next.fetch_add(1, Ordering::Relaxed) as usize) % pool.cells.len();
-    let cell = pool.cells[index].clone();
-    let result = invoke_cell(&cell, &request, Duration::from_millis(timeout_ms)).await;
+
+    let result = async {
+        let pool = ensure_pool(&state, &key).await?;
+        let (handle, permit) = acquire_cell(&pool)?;
+        let result = invoke_cell(&handle.cell, &request, Duration::from_millis(timeout_ms)).await;
+        drop(permit);
+        return result;
+    }
+    .await;
+
     state.completed.fetch_add(1, Ordering::Relaxed);
     if result.is_err() {
         state.failed.fetch_add(1, Ordering::Relaxed);
     }
 
     let retire = match &result {
-        Ok(_) => cell.lock().await.invocation_count >= state.max_cell_invocations,
+        Ok(_) => {
+            let pool = state.pools.lock().await.get(&key).cloned();
+            if let Some(pool) = pool {
+                cell_limit_reached(&pool, state.max_cell_invocations).await
+            } else {
+                false
+            }
+        }
         Err(_) => true,
     };
     if retire {
@@ -397,7 +429,25 @@ async fn invoke(
             error: Some(error.to_string()),
         },
     };
-    Ok(Json(response))
+    return Ok(Json(response));
+}
+
+fn acquire_cell(pool: &Arc<CellPool>) -> Result<(Arc<CellHandle>, OwnedSemaphorePermit)> {
+    let len = pool.cells.len();
+    if len == 0 {
+        bail!("tenant generation pool has no cells");
+    }
+
+    let start = (pool.next.fetch_add(1, Ordering::Relaxed) as usize) % len;
+    for offset in 0..len {
+        let index = (start + offset) % len;
+        let handle = pool.cells[index].clone();
+        if let Ok(permit) = handle.slot.clone().try_acquire_owned() {
+            return Ok((handle, permit));
+        }
+    }
+
+    bail!("tenant generation concurrency is exhausted");
 }
 
 async fn ensure_pool(state: &AppState, key: &CellKey) -> Result<Arc<CellPool>> {
@@ -405,57 +455,87 @@ async fn ensure_pool(state: &AppState, key: &CellKey) -> Result<Arc<CellPool>> {
         return Ok(pool);
     }
 
+    let candidate = spawn_pool(state, key).await?;
+    let mut pools = state.pools.lock().await;
+    if let Some(existing) = pools.get(key).cloned() {
+        drop(pools);
+        terminate_pool(&candidate).await;
+        return Ok(existing);
+    }
+    pools.insert(key.clone(), candidate.clone());
+    return Ok(candidate);
+}
+
+async fn spawn_pool(state: &AppState, key: &CellKey) -> Result<Arc<CellPool>> {
     let mut cells = Vec::with_capacity(state.pool_size);
     for _ in 0..state.pool_size {
         match spawn_cell(state, key).await {
-            Ok(cell) => cells.push(Arc::new(Mutex::new(cell))),
+            Ok(cell) => cells.push(Arc::new(CellHandle {
+                cell: Mutex::new(cell),
+                slot: Arc::new(Semaphore::new(1)),
+            })),
             Err(error) => {
-                for cell in cells {
-                    let mut cell = cell.lock().await;
-                    let _ = cell.child.kill().await;
-                    let _ = cell.child.wait().await;
-                }
+                let pool = Arc::new(CellPool {
+                    cells,
+                    next: AtomicU64::new(0),
+                });
+                terminate_pool(&pool).await;
                 return Err(error);
             }
         }
     }
-    let pool = Arc::new(CellPool { cells, next: AtomicU64::new(0) });
-    let mut pools = state.pools.lock().await;
-    Ok(pools.entry(key.clone()).or_insert_with(|| pool.clone()).clone())
+
+    return Ok(Arc::new(CellPool {
+        cells,
+        next: AtomicU64::new(0),
+    }));
 }
 
 async fn spawn_cell(state: &AppState, key: &CellKey) -> Result<Cell> {
-    let artifact = artifact_path(&state.artifact_root, key, "gs-lambda-cell.jar")?;
-    if !artifact.is_file() {
-        bail!("JVM cell artifact is missing for the requested deployment");
-    }
+    let deployment_root = deployment_path(&state.artifact_root, key)?;
+    let artifact = secure_regular_file(&deployment_root.join("gs-lambda-cell.jar"))?;
+    let _manifest = secure_regular_file(&deployment_root.join("manifest.json"))?;
     let live_permit = state.cell_slots.clone().try_acquire_owned().map_err(|_| {
-        anyhow!("live JVM cell limit reached; retire an idle pool before cold start")
+        anyhow!("live JVM cell limit reached; retire an idle generation before cold start")
     })?;
+
     let mut child = Command::new(state.java_command.as_ref())
-        .arg("-cp").arg(&artifact).arg(state.main_class.as_ref())
+        .arg("-cp")
+        .arg(&artifact)
+        .arg(state.main_class.as_ref())
         .env("GS_TENANT_ID", &key.tenant_id)
         .env("GS_DEPLOYMENT_ID", &key.deployment_id)
-        .env("GS_MAX_CELL_INVOCATIONS", state.max_cell_invocations.to_string())
+        .env("GS_DEPLOYMENT_ROOT", &deployment_root)
+        .env(
+            "GS_MAX_CELL_INVOCATIONS",
+            state.max_cell_invocations.to_string(),
+        )
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to start {}", state.java_command))?;
-    let stdin = child.stdin.take().ok_or_else(|| anyhow!("JVM cell stdin unavailable"))?;
-    let stdout = child.stdout.take().ok_or_else(|| anyhow!("JVM cell stdout unavailable"))?;
-    Ok(Cell {
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("JVM cell stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("JVM cell stdout unavailable"))?;
+    return Ok(Cell {
         child,
         stdin,
         stdout: BufReader::new(stdout),
         invocation_count: 0,
         _live_permit: live_permit,
-    })
+    });
 }
 
 async fn invoke_cell(
-    cell: &Arc<Mutex<Cell>>,
+    cell: &Mutex<Cell>,
     request: &InvocationRequest,
     deadline: Duration,
 ) -> Result<Value> {
@@ -463,6 +543,7 @@ async fn invoke_cell(
     if cell.child.try_wait()?.is_some() {
         bail!("JVM isolate cell exited before invocation");
     }
+
     let envelope = json!({
         "invocation_id": request.invocation_id,
         "tenant_id": request.tenant_id,
@@ -474,21 +555,28 @@ async fn invoke_cell(
     cell.stdin.write_all(&line).await?;
     cell.stdin.flush().await?;
 
-    let response_line = timeout(deadline,
-        read_bounded_line(&mut cell.stdout, MAX_CELL_RESPONSE_BYTES))
-        .await
-        .map_err(|_| anyhow!("logical invocation timed out; isolate pool will be retired"))??;
+    let response_line = timeout(
+        deadline,
+        read_bounded_line(&mut cell.stdout, MAX_CELL_RESPONSE_BYTES),
+    )
+    .await
+    .map_err(|_| anyhow!("logical invocation timed out; isolate generation will be retired"))??;
     if response_line.is_empty() {
         bail!("JVM isolate cell closed its output");
     }
-    let response: Value = serde_json::from_slice(&response_line)
-        .context("JVM isolate cell returned invalid JSON")?;
+
+    let response: Value =
+        serde_json::from_slice(&response_line).context("JVM isolate cell returned invalid JSON")?;
     if response.get("ok").and_then(Value::as_bool) != Some(true) {
-        bail!("{}", response.get("error").and_then(Value::as_str)
-            .unwrap_or("JVM isolate invocation failed"));
+        let message = response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("JVM isolate invocation failed");
+        bail!("{message}");
     }
+
     cell.invocation_count = cell.invocation_count.saturating_add(1);
-    Ok(response.get("payload").cloned().unwrap_or(Value::Null))
+    return Ok(response.get("payload").cloned().unwrap_or(Value::Null));
 }
 
 async fn read_bounded_line(
@@ -526,17 +614,31 @@ async fn read_bounded_line(
     }
 }
 
+async fn cell_limit_reached(pool: &Arc<CellPool>, max_invocations: u64) -> bool {
+    for handle in &pool.cells {
+        let cell = handle.cell.lock().await;
+        if cell.invocation_count >= max_invocations {
+            return true;
+        }
+    }
+    return false;
+}
+
 async fn retire_pool(state: &AppState, key: &CellKey) -> bool {
     let pool = state.pools.lock().await.remove(key);
     if let Some(pool) = pool {
-        for cell in &pool.cells {
-            let mut cell = cell.lock().await;
-            let _ = cell.child.kill().await;
-            let _ = cell.child.wait().await;
-        }
+        terminate_pool(&pool).await;
         return true;
     }
-    false
+    return false;
+}
+
+async fn terminate_pool(pool: &Arc<CellPool>) {
+    for handle in &pool.cells {
+        let mut cell = handle.cell.lock().await;
+        let _ = cell.child.kill().await;
+        let _ = cell.child.wait().await;
+    }
 }
 
 async fn terminate_all_cells(state: &AppState) {
@@ -545,21 +647,27 @@ async fn terminate_all_cells(state: &AppState) {
         map.drain().map(|(_, pool)| pool).collect::<Vec<_>>()
     };
     for pool in pools {
-        for cell in &pool.cells {
-            let mut cell = cell.lock().await;
-            let _ = cell.child.kill().await;
-            let _ = cell.child.wait().await;
-        }
+        terminate_pool(&pool).await;
     }
 }
 
-fn artifact_path(root: &Path, key: &CellKey, filename: &str) -> Result<PathBuf> {
+fn deployment_path(root: &Path, key: &CellKey) -> Result<PathBuf> {
     validate_path_component(&key.tenant_id)?;
     validate_path_component(&key.deployment_id)?;
-    return Ok(root
-        .join(&key.tenant_id)
-        .join(&key.deployment_id)
-        .join(filename));
+    return Ok(root.join(&key.tenant_id).join(&key.deployment_id));
+}
+
+fn artifact_path(root: &Path, key: &CellKey, filename: &str) -> Result<PathBuf> {
+    return Ok(deployment_path(root, key)?.join(filename));
+}
+
+fn secure_regular_file(path: &Path) -> Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect deployment artifact {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("deployment artifact must be a regular non-symlink file");
+    }
+    return Ok(path.to_path_buf());
 }
 
 fn validate_path_component(value: &str) -> Result<()> {
@@ -765,7 +873,7 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
 
 fn service_unavailable(error: impl std::fmt::Display) -> (StatusCode, String) {
     let message = error.to_string();
-    if message.contains("live JVM cell limit reached") {
+    if message.contains("limit reached") || message.contains("concurrency is exhausted") {
         return (StatusCode::SERVICE_UNAVAILABLE, message);
     }
     return internal_error(message);
