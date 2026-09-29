@@ -211,7 +211,10 @@ fn load_config() -> Result<RuntimeConfig> {
         .parse_structured(&argv, Some(config_path_text))
         .map_err(|error| anyhow!(error.to_string()))?;
     if !parsed.unknown_options.is_empty() {
-        bail!("unknown command-line options: {}", parsed.unknown_options.len());
+        bail!(
+            "unknown command-line options: {}",
+            parsed.unknown_options.len()
+        );
     }
     if !parsed.errors.is_empty() {
         bail!("invalid command-line values: {}", parsed.errors.join("; "));
