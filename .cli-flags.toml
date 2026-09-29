@@ -25,27 +25,118 @@ env = "GS_CELL_MAIN_CLASS"
 aliases = ["main-class"]
 type = "string"
 default = "dev.graalshow.lambda.CellMain"
-help = "Pinned JVM cell main class."
+help = "Pinned Graal tenant-cell main class."
 
 [flags.artifact-root]
 env = "GS_ARTIFACT_ROOT"
 aliases = ["artifact-root"]
 type = "string"
-help = "Root containing tenant/deployment gs-lambda-cell.jar artifacts."
+help = "Root containing immutable <tenant>/<deployment>/gs-lambda-cell.jar, manifest.json, and guest sources."
+
+[flags.max-parallel]
+env = "GS_MAX_PARALLEL_INVOCATIONS"
+aliases = ["max-parallel"]
+type = "integer"
+default = 256
+help = "Maximum concurrent invocations admitted by this daemon."
 
 [flags.max-cell-invocations]
 env = "GS_MAX_CELL_INVOCATIONS"
 aliases = ["max-cell-invocations"]
 type = "integer"
-default = 1000
-help = "Maximum successful logical actor invocations before retiring a reusable JVM cell."
+default = 100000
+help = "Drain and recycle a warm Graal cell after this many admitted invocations."
 
 [flags.max-live-cells]
 env = "GS_MAX_LIVE_CELLS"
 aliases = ["max-live-cells"]
 type = "integer"
-default = 64
-help = "Maximum simultaneously resident tenant+deployment JVM cells. Capacity is reserved before JVM spawn."
+default = 256
+help = "Maximum simultaneously resident tenant+deployment Graal process cells."
+
+[flags.max-cells-per-generation]
+env = "GS_MAX_CELLS_PER_GENERATION"
+aliases = ["max-cells-per-generation"]
+type = "integer"
+default = 4
+help = "Maximum warm process/Engine cells for one tenant+deployment generation."
+
+[flags.max-cell-concurrency]
+env = "GS_MAX_CELL_CONCURRENCY"
+aliases = ["max-cell-concurrency"]
+type = "integer"
+default = 16
+help = "Maximum concurrent fresh Graal Contexts within one warm Engine cell."
+
+[flags.cell-idle-ttl-ms]
+env = "GS_CELL_IDLE_TTL_MS"
+aliases = ["cell-idle-ttl-ms"]
+type = "integer"
+default = 300000
+help = "Retire an idle Graal cell after this many milliseconds."
+
+[flags.max-cell-age-ms]
+env = "GS_MAX_CELL_AGE_MS"
+aliases = ["max-cell-age-ms"]
+type = "integer"
+default = 3600000
+help = "Recycle a warm Graal cell after this maximum age in milliseconds."
+
+[flags.max-isolate-memory]
+env = "GS_MAX_ISOLATE_MEMORY"
+aliases = ["max-isolate-memory"]
+type = "string"
+default = "256MB"
+help = "Maximum memory for the tenant Polyglot isolate."
+
+[flags.max-guest-heap-memory]
+env = "GS_MAX_GUEST_HEAP_MEMORY"
+aliases = ["max-guest-heap-memory"]
+type = "string"
+default = "128MB"
+help = "Maximum guest heap per sandboxed Context."
+
+[flags.max-guest-cpu-time-ms]
+env = "GS_MAX_GUEST_CPU_TIME_MS"
+aliases = ["max-guest-cpu-time-ms"]
+type = "integer"
+default = 30000
+help = "Maximum guest CPU time per invocation; request deadlines may lower this value."
+
+[flags.max-ast-depth]
+env = "GS_MAX_AST_DEPTH"
+aliases = ["max-ast-depth"]
+type = "integer"
+default = 100
+help = "Maximum guest AST depth required by the UNTRUSTED sandbox profile."
+
+[flags.max-guest-threads]
+env = "GS_MAX_GUEST_THREADS"
+aliases = ["max-guest-threads"]
+type = "integer"
+default = 1
+help = "Maximum guest-created threads per Context."
+
+[flags.max-guest-stdout]
+env = "GS_MAX_GUEST_STDOUT"
+aliases = ["max-guest-stdout"]
+type = "string"
+default = "1MB"
+help = "Maximum sandboxed guest stdout captured per Context."
+
+[flags.max-guest-stderr]
+env = "GS_MAX_GUEST_STDERR"
+aliases = ["max-guest-stderr"]
+type = "string"
+default = "1MB"
+help = "Maximum sandboxed guest stderr captured per Context."
+
+[flags.isolate-mode]
+env = "GS_ISOLATE_MODE"
+aliases = ["isolate-mode"]
+type = "string"
+default = "internal"
+help = "Polyglot isolate mode: internal or external. External is an experimental GraalVM 25 hardening option."
 
 [flags.token-file]
 env = "GS_DESKTOP_TOKEN_FILE"

@@ -1,3 +1,5 @@
+mod cells;
+
 use anyhow::{Context as _, Result, anyhow, bail};
 use axum::{
     Json, Router,
@@ -5,6 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use cells::{CellPool, CellPoolConfig, CellStatus};
 use flags2env::BundledFlags2Env;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,20 +22,19 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
-    time::timeout,
-};
+use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_BODY_BYTES: usize = 256 * 1024;
-const MAX_CELL_INVOCATIONS: u64 = 1_000_000;
-const MAX_LIVE_CELLS: usize = 2048;
-const MAX_CELL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PARALLELISM: usize = 4096;
+const MAX_CELL_INVOCATIONS: u64 = 10_000_000;
+const MAX_LIVE_CELLS: usize = 4096;
+const MAX_CELLS_PER_GENERATION: usize = 64;
+const MAX_CELL_CONCURRENCY: usize = 1024;
+const MAX_CELL_IDLE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_CELL_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
@@ -41,8 +43,21 @@ struct CliConfig {
     GS_JAVA_COMMAND: String,
     GS_CELL_MAIN_CLASS: String,
     GS_ARTIFACT_ROOT: Option<String>,
+    GS_MAX_PARALLEL_INVOCATIONS: i64,
     GS_MAX_CELL_INVOCATIONS: i64,
     GS_MAX_LIVE_CELLS: i64,
+    GS_MAX_CELLS_PER_GENERATION: i64,
+    GS_MAX_CELL_CONCURRENCY: i64,
+    GS_CELL_IDLE_TTL_MS: i64,
+    GS_MAX_CELL_AGE_MS: i64,
+    GS_MAX_ISOLATE_MEMORY: String,
+    GS_MAX_GUEST_HEAP_MEMORY: String,
+    GS_MAX_GUEST_CPU_TIME_MS: i64,
+    GS_MAX_AST_DEPTH: i64,
+    GS_MAX_GUEST_THREADS: i64,
+    GS_MAX_GUEST_STDOUT: String,
+    GS_MAX_GUEST_STDERR: String,
+    GS_ISOLATE_MODE: String,
     GS_DESKTOP_TOKEN_FILE: Option<String>,
     GS_DESKTOP_LOG: String,
 }
@@ -50,39 +65,17 @@ struct CliConfig {
 #[derive(Debug)]
 struct RuntimeConfig {
     addr: SocketAddr,
-    java_command: String,
-    main_class: String,
-    artifact_root: PathBuf,
-    max_cell_invocations: u64,
-    max_live_cells: usize,
+    parallelism: usize,
+    cells: CellPoolConfig,
     token_path: PathBuf,
     log_filter: String,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct CellKey {
-    tenant_id: String,
-    deployment_id: String,
-}
-
-struct Cell {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    invocation_count: u64,
-    _live_permit: OwnedSemaphorePermit,
 }
 
 #[derive(Clone)]
 struct AppState {
     token: Arc<str>,
-    java_command: Arc<str>,
-    main_class: Arc<str>,
-    artifact_root: Arc<PathBuf>,
-    max_cell_invocations: u64,
-    max_live_cells: usize,
-    cell_slots: Arc<Semaphore>,
-    cells: Arc<Mutex<HashMap<CellKey, Arc<Mutex<Cell>>>>>,
+    permits: Arc<Semaphore>,
+    cells: CellPool,
     started_at: Instant,
     accepted: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
@@ -112,25 +105,22 @@ struct InvocationResponse {
 struct StatusResponse {
     runtime: &'static str,
     logical_actor_reusable: bool,
-    jvm_cell_reusable: bool,
+    context_reusable: bool,
+    engine_cell_reusable: bool,
     cell_reuse_scope: &'static str,
+    security_boundary: &'static str,
+    request_protocol: &'static str,
     config_source: &'static str,
     uptime_ms: u128,
     accepted: u64,
     completed: u64,
     failed: u64,
     live_cells: usize,
-    max_cell_invocations: u64,
-    max_live_cells: usize,
+    available_invocation_slots: usize,
     available_cell_slots: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct CellStatus {
-    tenant_id: String,
-    deployment_id: String,
-    invocation_count: u64,
-    running: bool,
+    max_cells_per_generation: usize,
+    max_cell_concurrency: usize,
+    max_cell_invocations: u64,
 }
 
 #[tokio::main]
@@ -141,15 +131,12 @@ async fn main() -> Result<()> {
         .init();
 
     let token = load_or_create_token(&config.token_path)?;
+    let cells = CellPool::new(config.cells);
+    cells.start_reaper();
     let state = AppState {
         token: Arc::from(token),
-        java_command: Arc::from(config.java_command),
-        main_class: Arc::from(config.main_class),
-        artifact_root: Arc::new(config.artifact_root),
-        max_cell_invocations: config.max_cell_invocations,
-        max_live_cells: config.max_live_cells,
-        cell_slots: Arc::new(Semaphore::new(config.max_live_cells)),
-        cells: Arc::new(Mutex::new(HashMap::new())),
+        permits: Arc::new(Semaphore::new(config.parallelism)),
+        cells,
         started_at: Instant::now(),
         accepted: Arc::new(AtomicU64::new(0)),
         completed: Arc::new(AtomicU64::new(0)),
@@ -163,6 +150,14 @@ async fn main() -> Result<()> {
         .route("/v1/cells", get(list_cells))
         .route(
             "/v1/cells/{tenant_id}/{deployment_id}/retire",
+            post(retire_generation_route),
+        )
+        .route(
+            "/v1/cells/{tenant_id}/{deployment_id}/{cell_index}/drain",
+            post(drain_cell_route),
+        )
+        .route(
+            "/v1/cells/{tenant_id}/{deployment_id}/{cell_index}/retire",
             post(retire_cell_route),
         )
         .route("/v1/invoke", post(invoke))
@@ -174,7 +169,7 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    terminate_all_cells(&state).await;
+    state.cells.shutdown().await;
     return Ok(());
 }
 
@@ -216,29 +211,73 @@ fn load_config() -> Result<RuntimeConfig> {
     if java_command.is_empty() {
         bail!("GS_JAVA_COMMAND may not be empty");
     }
-    let main_class = raw_config.GS_CELL_MAIN_CLASS.trim().to_owned();
-    if main_class.is_empty()
-        || main_class.len() > 512
-        || !main_class
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'$'))
-    {
-        bail!("GS_CELL_MAIN_CLASS is invalid");
-    }
+    let main_class = validate_main_class(&raw_config.GS_CELL_MAIN_CLASS)?;
     let artifact_root = match raw_config.GS_ARTIFACT_ROOT {
         Some(path) if !path.trim().is_empty() => expand_home(Path::new(&path))?,
         _ => default_artifact_root()?,
     };
-    let max_cell_invocations = u64::try_from(raw_config.GS_MAX_CELL_INVOCATIONS)
-        .ok()
-        .filter(|value| *value > 0 && *value <= MAX_CELL_INVOCATIONS)
-        .ok_or_else(|| {
-            anyhow!("GS_MAX_CELL_INVOCATIONS must be between 1 and {MAX_CELL_INVOCATIONS}")
-        })?;
-    let max_live_cells = usize::try_from(raw_config.GS_MAX_LIVE_CELLS)
-        .ok()
-        .filter(|value| *value > 0 && *value <= MAX_LIVE_CELLS)
-        .ok_or_else(|| anyhow!("GS_MAX_LIVE_CELLS must be between 1 and {MAX_LIVE_CELLS}"))?;
+    let parallelism = bounded_usize(
+        "GS_MAX_PARALLEL_INVOCATIONS",
+        raw_config.GS_MAX_PARALLEL_INVOCATIONS,
+        MAX_PARALLELISM,
+    )?;
+    let max_live_cells = bounded_usize(
+        "GS_MAX_LIVE_CELLS",
+        raw_config.GS_MAX_LIVE_CELLS,
+        MAX_LIVE_CELLS,
+    )?;
+    let max_cells_per_generation = bounded_usize(
+        "GS_MAX_CELLS_PER_GENERATION",
+        raw_config.GS_MAX_CELLS_PER_GENERATION,
+        MAX_CELLS_PER_GENERATION,
+    )?;
+    let max_cell_concurrency = bounded_usize(
+        "GS_MAX_CELL_CONCURRENCY",
+        raw_config.GS_MAX_CELL_CONCURRENCY,
+        MAX_CELL_CONCURRENCY,
+    )?;
+    let max_cell_invocations = bounded_u64(
+        "GS_MAX_CELL_INVOCATIONS",
+        raw_config.GS_MAX_CELL_INVOCATIONS,
+        MAX_CELL_INVOCATIONS,
+    )?;
+    let cell_idle_ttl_ms = bounded_u64(
+        "GS_CELL_IDLE_TTL_MS",
+        raw_config.GS_CELL_IDLE_TTL_MS,
+        MAX_CELL_IDLE_TTL_MS,
+    )?;
+    let max_cell_age_ms = bounded_u64(
+        "GS_MAX_CELL_AGE_MS",
+        raw_config.GS_MAX_CELL_AGE_MS,
+        MAX_CELL_AGE_MS,
+    )?;
+    let max_guest_cpu_time_ms = bounded_u64(
+        "GS_MAX_GUEST_CPU_TIME_MS",
+        raw_config.GS_MAX_GUEST_CPU_TIME_MS,
+        MAX_TIMEOUT_MS,
+    )?;
+    let max_ast_depth = bounded_u32("GS_MAX_AST_DEPTH", raw_config.GS_MAX_AST_DEPTH, 100_000)?;
+    let max_guest_threads = bounded_u32(
+        "GS_MAX_GUEST_THREADS",
+        raw_config.GS_MAX_GUEST_THREADS,
+        64,
+    )?;
+    let max_isolate_memory = validate_memory_limit(
+        "GS_MAX_ISOLATE_MEMORY",
+        &raw_config.GS_MAX_ISOLATE_MEMORY,
+    )?;
+    let max_guest_heap_memory = validate_memory_limit(
+        "GS_MAX_GUEST_HEAP_MEMORY",
+        &raw_config.GS_MAX_GUEST_HEAP_MEMORY,
+    )?;
+    let max_guest_stdout =
+        validate_memory_limit("GS_MAX_GUEST_STDOUT", &raw_config.GS_MAX_GUEST_STDOUT)?;
+    let max_guest_stderr =
+        validate_memory_limit("GS_MAX_GUEST_STDERR", &raw_config.GS_MAX_GUEST_STDERR)?;
+    let isolate_mode = raw_config.GS_ISOLATE_MODE.trim().to_ascii_lowercase();
+    if isolate_mode != "internal" && isolate_mode != "external" {
+        bail!("GS_ISOLATE_MODE must be internal or external");
+    }
     let token_path = match raw_config.GS_DESKTOP_TOKEN_FILE {
         Some(path) if !path.trim().is_empty() => expand_home(Path::new(&path))?,
         _ => default_token_path()?,
@@ -246,14 +285,80 @@ fn load_config() -> Result<RuntimeConfig> {
 
     return Ok(RuntimeConfig {
         addr,
-        java_command,
-        main_class,
-        artifact_root,
-        max_cell_invocations,
-        max_live_cells,
+        parallelism,
+        cells: CellPoolConfig {
+            java_command,
+            main_class,
+            artifact_root,
+            max_live_cells,
+            max_cells_per_generation,
+            max_cell_concurrency,
+            max_cell_invocations,
+            cell_idle_ttl: Duration::from_millis(cell_idle_ttl_ms),
+            max_cell_age: Duration::from_millis(max_cell_age_ms),
+            max_isolate_memory,
+            max_guest_heap_memory,
+            max_guest_cpu_time_ms,
+            max_ast_depth,
+            max_guest_threads,
+            max_guest_stdout,
+            max_guest_stderr,
+            isolate_mode,
+        },
         token_path,
         log_filter: raw_config.GS_DESKTOP_LOG,
     });
+}
+
+fn validate_main_class(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 512
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'$'))
+    {
+        bail!("GS_CELL_MAIN_CLASS is invalid");
+    }
+    return Ok(value.to_owned());
+}
+
+fn bounded_usize(name: &str, value: i64, maximum: usize) -> Result<usize> {
+    let value = usize::try_from(value)
+        .ok()
+        .filter(|value| *value > 0 && *value <= maximum)
+        .ok_or_else(|| anyhow!("{name} must be between 1 and {maximum}"))?;
+    return Ok(value);
+}
+
+fn bounded_u64(name: &str, value: i64, maximum: u64) -> Result<u64> {
+    let value = u64::try_from(value)
+        .ok()
+        .filter(|value| *value > 0 && *value <= maximum)
+        .ok_or_else(|| anyhow!("{name} must be between 1 and {maximum}"))?;
+    return Ok(value);
+}
+
+fn bounded_u32(name: &str, value: i64, maximum: u32) -> Result<u32> {
+    let value = u32::try_from(value)
+        .ok()
+        .filter(|value| *value > 0 && *value <= maximum)
+        .ok_or_else(|| anyhow!("{name} must be between 1 and {maximum}"))?;
+    return Ok(value);
+}
+
+fn validate_memory_limit(name: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    let suffix = ["KB", "MB", "GB"]
+        .into_iter()
+        .find(|suffix| value.ends_with(suffix))
+        .ok_or_else(|| anyhow!("{name} must use KB, MB, or GB units"))?;
+    let number = value.trim_end_matches(suffix);
+    if number.is_empty() || number.starts_with('0') || !number.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        bail!("{name} must be a positive integer followed by {suffix}");
+    }
+    return Ok(value.to_owned());
 }
 
 async fn health() -> &'static str {
@@ -265,21 +370,25 @@ async fn status(
     headers: HeaderMap,
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
     authorize(&headers, &state)?;
-    let live_cells = state.cells.lock().await.len();
     return Ok(Json(StatusResponse {
-        runtime: "graalvm_jvm",
+        runtime: "graalvm_polyglot",
         logical_actor_reusable: false,
-        jvm_cell_reusable: true,
+        context_reusable: false,
+        engine_cell_reusable: true,
         cell_reuse_scope: "same_tenant_generation",
+        security_boundary: "polyglot_isolate_in_tenant_process",
+        request_protocol: "u32be_length_prefixed_json_v1",
         config_source: "flags-2-env",
         uptime_ms: state.started_at.elapsed().as_millis(),
         accepted: state.accepted.load(Ordering::Relaxed),
         completed: state.completed.load(Ordering::Relaxed),
         failed: state.failed.load(Ordering::Relaxed),
-        live_cells,
-        max_cell_invocations: state.max_cell_invocations,
-        max_live_cells: state.max_live_cells,
-        available_cell_slots: state.cell_slots.available_permits(),
+        live_cells: state.cells.live_cells().await,
+        available_invocation_slots: state.permits.available_permits(),
+        available_cell_slots: state.cells.available_cell_slots(),
+        max_cells_per_generation: state.cells.max_cells_per_generation(),
+        max_cell_concurrency: state.cells.max_cell_concurrency(),
+        max_cell_invocations: state.cells.max_cell_invocations(),
     }));
 }
 
@@ -288,29 +397,10 @@ async fn list_cells(
     headers: HeaderMap,
 ) -> Result<Json<Vec<CellStatus>>, (StatusCode, String)> {
     authorize(&headers, &state)?;
-    let cells = {
-        let cells = state.cells.lock().await;
-        cells
-            .iter()
-            .map(|(key, cell)| (key.clone(), cell.clone()))
-            .collect::<Vec<_>>()
-    };
-
-    let mut statuses = Vec::with_capacity(cells.len());
-    for (key, cell) in cells {
-        let mut cell = cell.lock().await;
-        let running = cell.child.try_wait().map_err(internal_error)?.is_none();
-        statuses.push(CellStatus {
-            tenant_id: key.tenant_id,
-            deployment_id: key.deployment_id,
-            invocation_count: cell.invocation_count,
-            running,
-        });
-    }
-    return Ok(Json(statuses));
+    return Ok(Json(state.cells.statuses().await));
 }
 
-async fn retire_cell_route(
+async fn retire_generation_route(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath((tenant_id, deployment_id)): AxumPath<(String, String)>,
@@ -318,11 +408,50 @@ async fn retire_cell_route(
     authorize(&headers, &state)?;
     validate_identifier("tenant_id", &tenant_id)?;
     validate_identifier("deployment_id", &deployment_id)?;
-    let key = CellKey {
-        tenant_id,
-        deployment_id,
-    };
-    let retired = retire_cell(&state, &key).await;
+    let indices = state
+        .cells
+        .statuses()
+        .await
+        .into_iter()
+        .filter(|cell| cell.tenant_id == tenant_id && cell.deployment_id == deployment_id)
+        .map(|cell| cell.cell_index)
+        .collect::<Vec<_>>();
+    let mut retired = 0_usize;
+    for index in indices {
+        if state.cells.retire(&tenant_id, &deployment_id, index).await {
+            retired = retired.saturating_add(1);
+        }
+    }
+    return Ok(Json(json!({ "retired": retired > 0, "retired_cells": retired })));
+}
+
+async fn drain_cell_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((tenant_id, deployment_id, cell_index)): AxumPath<(String, String, u32)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
+    validate_identifier("tenant_id", &tenant_id)?;
+    validate_identifier("deployment_id", &deployment_id)?;
+    let draining = state
+        .cells
+        .drain(&tenant_id, &deployment_id, cell_index)
+        .await;
+    return Ok(Json(json!({ "draining": draining })));
+}
+
+async fn retire_cell_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((tenant_id, deployment_id, cell_index)): AxumPath<(String, String, u32)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
+    validate_identifier("tenant_id", &tenant_id)?;
+    validate_identifier("deployment_id", &deployment_id)?;
+    let retired = state
+        .cells
+        .retire(&tenant_id, &deployment_id, cell_index)
+        .await;
     return Ok(Json(json!({ "retired": retired })));
 }
 
@@ -344,29 +473,27 @@ async fn invoke(
         ));
     }
 
+    let _permit = state.permits.clone().try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Graal invocation capacity is exhausted".to_owned(),
+        )
+    })?;
     state.accepted.fetch_add(1, Ordering::Relaxed);
-    let key = CellKey {
-        tenant_id: request.tenant_id.clone(),
-        deployment_id: request.deployment_id.clone(),
-    };
-    let cell = ensure_cell(&state, &key)
-        .await
-        .map_err(service_unavailable)?;
-    let result = invoke_cell(&cell, &request, Duration::from_millis(timeout_ms)).await;
+
+    let result = state
+        .cells
+        .invoke(
+            &request.tenant_id,
+            &request.deployment_id,
+            &request.invocation_id,
+            &request.payload_json,
+            timeout_ms,
+        )
+        .await;
     state.completed.fetch_add(1, Ordering::Relaxed);
     if result.is_err() {
         state.failed.fetch_add(1, Ordering::Relaxed);
-    }
-
-    let retire = match &result {
-        Ok(_) => {
-            let guard = cell.lock().await;
-            guard.invocation_count >= state.max_cell_invocations
-        }
-        Err(_) => true,
-    };
-    if retire {
-        let _ = retire_cell(&state, &key).await;
     }
 
     let response = match result {
@@ -388,194 +515,6 @@ async fn invoke(
     return Ok(Json(response));
 }
 
-async fn ensure_cell(state: &AppState, key: &CellKey) -> Result<Arc<Mutex<Cell>>> {
-    if let Some(cell) = state.cells.lock().await.get(key).cloned() {
-        let running = {
-            let mut guard = cell.lock().await;
-            guard.child.try_wait()?.is_none()
-        };
-        if running {
-            return Ok(cell);
-        }
-        let _ = retire_cell(state, key).await;
-    }
-
-    let artifact = artifact_path(&state.artifact_root, key, "gs-lambda-cell.jar")?;
-    if !artifact.is_file() {
-        bail!("JVM cell artifact is missing for the requested deployment");
-    }
-
-    let live_permit = state.cell_slots.clone().try_acquire_owned().map_err(|_| {
-        anyhow!("live JVM cell limit reached; retire an idle cell before cold start")
-    })?;
-
-    let mut child = Command::new(state.java_command.as_ref())
-        .arg("-cp")
-        .arg(&artifact)
-        .arg(state.main_class.as_ref())
-        .env("GS_TENANT_ID", &key.tenant_id)
-        .env("GS_DEPLOYMENT_ID", &key.deployment_id)
-        .env(
-            "GS_MAX_CELL_INVOCATIONS",
-            state.max_cell_invocations.to_string(),
-        )
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("failed to start {}", state.java_command))?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("JVM cell stdin unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("JVM cell stdout unavailable"))?;
-    let cell = Arc::new(Mutex::new(Cell {
-        child,
-        stdin,
-        stdout: BufReader::new(stdout),
-        invocation_count: 0,
-        _live_permit: live_permit,
-    }));
-
-    let mut cells = state.cells.lock().await;
-    if let Some(existing) = cells.get(key).cloned() {
-        drop(cells);
-        let mut unused = cell.lock().await;
-        let _ = unused.child.kill().await;
-        let _ = unused.child.wait().await;
-        return Ok(existing);
-    }
-    cells.insert(key.clone(), cell.clone());
-    return Ok(cell);
-}
-
-async fn invoke_cell(
-    cell: &Arc<Mutex<Cell>>,
-    request: &InvocationRequest,
-    deadline: Duration,
-) -> Result<Value> {
-    let mut cell = cell.lock().await;
-    let envelope = json!({
-        "invocation_id": request.invocation_id,
-        "tenant_id": request.tenant_id,
-        "deployment_id": request.deployment_id,
-        "payload": request.payload_json,
-    });
-    let mut line = serde_json::to_vec(&envelope)?;
-    line.push(b'\n');
-    cell.stdin.write_all(&line).await?;
-    cell.stdin.flush().await?;
-
-    let response_line = timeout(
-        deadline,
-        read_bounded_line(&mut cell.stdout, MAX_CELL_RESPONSE_BYTES),
-    )
-    .await
-    .map_err(|_| anyhow!("logical actor invocation timed out; JVM cell will be retired"))??;
-    if response_line.is_empty() {
-        bail!("JVM cell closed its output");
-    }
-
-    let response: Value =
-        serde_json::from_slice(&response_line).context("JVM cell returned invalid JSON")?;
-    if response.get("ok").and_then(Value::as_bool) != Some(true) {
-        let message = response
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("JVM actor invocation failed");
-        bail!("{message}");
-    }
-
-    cell.invocation_count = cell.invocation_count.saturating_add(1);
-    return Ok(response.get("payload").cloned().unwrap_or(Value::Null));
-}
-
-async fn read_bounded_line(
-    reader: &mut BufReader<ChildStdout>,
-    max_bytes: usize,
-) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    loop {
-        let (chunk, consumed, found_newline) = {
-            let buffer = reader.fill_buf().await?;
-            if buffer.is_empty() {
-                if output.is_empty() {
-                    bail!("JVM cell closed its output");
-                }
-                return Ok(output);
-            }
-            let newline = buffer.iter().position(|byte| *byte == b'\n');
-            let consumed = newline.map(|index| index + 1).unwrap_or(buffer.len());
-            if output.len().saturating_add(consumed) > max_bytes {
-                bail!("JVM cell response exceeds {max_bytes} bytes");
-            }
-            (buffer[..consumed].to_vec(), consumed, newline.is_some())
-        };
-        output.extend_from_slice(&chunk);
-        reader.consume(consumed);
-        if found_newline {
-            if output.last() == Some(&b'\n') {
-                output.pop();
-            }
-            if output.last() == Some(&b'\r') {
-                output.pop();
-            }
-            return Ok(output);
-        }
-    }
-}
-
-async fn retire_cell(state: &AppState, key: &CellKey) -> bool {
-    let cell = state.cells.lock().await.remove(key);
-    if let Some(cell) = cell {
-        let mut cell = cell.lock().await;
-        let _ = cell.child.kill().await;
-        let _ = cell.child.wait().await;
-        return true;
-    }
-    return false;
-}
-
-async fn terminate_all_cells(state: &AppState) {
-    let cells = {
-        let mut map = state.cells.lock().await;
-        map.drain().map(|(_, cell)| cell).collect::<Vec<_>>()
-    };
-    for cell in cells {
-        let mut cell = cell.lock().await;
-        let _ = cell.child.kill().await;
-        let _ = cell.child.wait().await;
-    }
-}
-
-fn artifact_path(root: &Path, key: &CellKey, filename: &str) -> Result<PathBuf> {
-    validate_path_component(&key.tenant_id)?;
-    validate_path_component(&key.deployment_id)?;
-    return Ok(root
-        .join(&key.tenant_id)
-        .join(&key.deployment_id)
-        .join(filename));
-}
-
-fn validate_path_component(value: &str) -> Result<()> {
-    let valid = !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        && value != "."
-        && value != "..";
-    if !valid {
-        bail!("invalid artifact path component");
-    }
-    return Ok(());
-}
-
 fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
     let provided = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -588,7 +527,14 @@ fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, S
 }
 
 fn validate_identifier(name: &str, value: &str) -> Result<(), (StatusCode, String)> {
-    if validate_path_component(value).is_ok() {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && value != "."
+        && value != "..";
+    if valid {
         return Ok(());
     }
     return Err((StatusCode::BAD_REQUEST, format!("invalid {name}")));
@@ -759,18 +705,6 @@ fn load_or_create_token(path: &Path) -> Result<String> {
     return Ok(token);
 }
 
-fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
-    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
-}
-
-fn service_unavailable(error: impl std::fmt::Display) -> (StatusCode, String) {
-    let message = error.to_string();
-    if message.contains("live JVM cell limit reached") {
-        return (StatusCode::SERVICE_UNAVAILABLE, message);
-    }
-    return internal_error(message);
-}
-
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
@@ -787,31 +721,18 @@ mod tests {
 
     #[test]
     fn deployment_key_rejects_path_traversal() {
-        assert!(validate_path_component("deployment-1").is_ok());
-        assert!(validate_path_component("..").is_err());
-        assert!(validate_path_component("tenant/escape").is_err());
+        assert!(validate_identifier("deployment_id", "deployment-1").is_ok());
+        assert!(validate_identifier("deployment_id", "..").is_err());
+        assert!(validate_identifier("deployment_id", "tenant/escape").is_err());
     }
 
     #[test]
-    fn artifact_path_is_tenant_and_generation_scoped() {
-        let root = PathBuf::from("/tmp/graal-show");
-        let key = CellKey {
-            tenant_id: "tenant-a".to_owned(),
-            deployment_id: "deploy-123".to_owned(),
-        };
-        let valid = artifact_path(&root, &key, "gs-lambda-cell.jar")
-            .map(|path| path.ends_with("tenant-a/deploy-123/gs-lambda-cell.jar"))
-            .unwrap_or(false);
-        assert!(valid);
-    }
-
-    #[tokio::test]
-    async fn cell_slot_limit_is_strict() {
-        let slots = Arc::new(Semaphore::new(1));
-        let first = slots.clone().try_acquire_owned();
-        assert!(first.is_ok());
-        assert!(slots.clone().try_acquire_owned().is_err());
-        drop(first);
-        assert!(slots.try_acquire_owned().is_ok());
+    fn memory_limits_require_units() {
+        assert_eq!(
+            validate_memory_limit("memory", "256MB").ok(),
+            Some("256MB".to_owned())
+        );
+        assert!(validate_memory_limit("memory", "0MB").is_err());
+        assert!(validate_memory_limit("memory", "256").is_err());
     }
 }
