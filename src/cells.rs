@@ -1,9 +1,11 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -53,6 +55,7 @@ struct CellKey {
 
 struct Cell {
     key: CellKey,
+    artifact_sha256: String,
     index: u32,
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
@@ -82,6 +85,7 @@ pub struct CellPool {
 pub struct CellStatus {
     pub tenant_id: String,
     pub deployment_id: String,
+    pub artifact_sha256: String,
     pub cell_index: u32,
     pub invocation_count: u64,
     pub active_invocations: u64,
@@ -147,6 +151,7 @@ impl CellPool {
             statuses.push(CellStatus {
                 tenant_id: cell.key.tenant_id.clone(),
                 deployment_id: cell.key.deployment_id.clone(),
+                artifact_sha256: cell.artifact_sha256.clone(),
                 cell_index: cell.index,
                 invocation_count: cell.invocation_count.load(Ordering::Relaxed),
                 active_invocations: cell.active.load(Ordering::Relaxed),
@@ -269,9 +274,16 @@ impl CellPool {
     }
 
     async fn lease_cell(&self, key: &CellKey) -> Result<(Arc<Cell>, OwnedSemaphorePermit)> {
+        let artifact_sha256 = generation_sha256(&self.inner.config.artifact_root, key)?;
         let mut cells = self.inner.cells.lock().await;
         let group = cells.entry(key.clone()).or_default();
         group.retain(|cell| !cell.failed.load(Ordering::Acquire));
+
+        for cell in group.iter() {
+            if cell.artifact_sha256 != artifact_sha256 {
+                cell.draining.store(true, Ordering::Release);
+            }
+        }
 
         for cell in group.iter() {
             if cell.draining.load(Ordering::Acquire) {
@@ -288,12 +300,18 @@ impl CellPool {
             }
         }
 
-        if group.len() >= self.inner.config.max_cells_per_generation {
-            bail!("all warm Graal cells for this tenant generation are busy");
+        let current_generation_cells = group
+            .iter()
+            .filter(|cell| {
+                !cell.failed.load(Ordering::Acquire) && cell.artifact_sha256 == artifact_sha256
+            })
+            .count();
+        if current_generation_cells >= self.inner.config.max_cells_per_generation {
+            bail!("all warm Graal cells for this immutable tenant generation are busy");
         }
 
         let index = next_cell_index(group);
-        let cell = self.spawn_cell(key.clone(), index)?;
+        let cell = self.spawn_cell(key.clone(), index, &artifact_sha256)?;
         let permit = cell
             .capacity
             .clone()
@@ -303,7 +321,7 @@ impl CellPool {
         return Ok((cell, permit));
     }
 
-    fn spawn_cell(&self, key: CellKey, index: u32) -> Result<Arc<Cell>> {
+    fn spawn_cell(&self, key: CellKey, index: u32, artifact_sha256: &str) -> Result<Arc<Cell>> {
         let live_permit = self
             .inner
             .cell_slots
@@ -317,6 +335,10 @@ impl CellPool {
             &artifact_dir.join("manifest.json"),
             "Graal deployment manifest",
         )?;
+        let actual_sha256 = sha256_file(&jar)?;
+        if actual_sha256 != artifact_sha256 {
+            bail!("Graal deployment artifact changed while preparing a warm cell");
+        }
 
         let mut child = Command::new(&self.inner.config.java_command)
             .arg("-cp")
@@ -326,6 +348,7 @@ impl CellPool {
             .env("GS_DEPLOYMENT_ID", &key.deployment_id)
             .env("GS_CELL_INDEX", index.to_string())
             .env("GS_ARTIFACT_DIR", &artifact_dir)
+            .env("GS_ARTIFACT_SHA256", artifact_sha256)
             .env(
                 "GS_MAX_CELL_INVOCATIONS",
                 self.inner.config.max_cell_invocations.to_string(),
@@ -395,6 +418,7 @@ impl CellPool {
 
         return Ok(Arc::new(Cell {
             key,
+            artifact_sha256: artifact_sha256.to_owned(),
             index,
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
@@ -456,6 +480,36 @@ fn artifact_dir(root: &Path, key: &CellKey) -> Result<PathBuf> {
     validate_path_component(&key.tenant_id)?;
     validate_path_component(&key.deployment_id)?;
     return Ok(root.join(&key.tenant_id).join(&key.deployment_id));
+}
+
+fn generation_sha256(root: &Path, key: &CellKey) -> Result<String> {
+    let artifact_dir = artifact_dir(root, key)?;
+    let jar = artifact_dir.join("gs-lambda-cell.jar");
+    require_regular_file(&jar, "Graal cell JAR")?;
+    require_regular_file(
+        &artifact_dir.join("manifest.json"),
+        "Graal deployment manifest",
+    )?;
+    return sha256_file(&jar);
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("cannot open deployment artifact {}", path.display()))?;
+    return sha256_reader(file);
+}
+
+fn sha256_reader<R: Read>(mut reader: R) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    return Ok(format!("{:x}", hasher.finalize()));
 }
 
 fn require_regular_file(path: &Path, description: &str) -> Result<()> {
@@ -685,5 +739,21 @@ mod tests {
         assert!(validate_path_component("deploy-1").is_ok());
         assert!(validate_path_component("..").is_err());
         assert!(validate_path_component("tenant/escape").is_err());
+    }
+}
+
+#[cfg(test)]
+mod generation_digest_tests {
+    use super::sha256_reader;
+    use std::io::Cursor;
+
+    #[test]
+    fn sha256_reader_matches_known_vector() -> anyhow::Result<()> {
+        let digest = sha256_reader(Cursor::new(b"abc"))?;
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        return Ok(());
     }
 }
