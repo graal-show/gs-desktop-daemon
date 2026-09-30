@@ -106,12 +106,13 @@ mod generation_digest_tests {
     use std::io::Cursor;
 
     #[test]
-    fn sha256_reader_matches_known_vector() {
-        let digest = sha256_reader(Cursor::new(b"abc")).expect("hash test vector");
+    fn sha256_reader_matches_known_vector() -> anyhow::Result<()> {
+        let digest = sha256_reader(Cursor::new(b"abc"))?;
         assert_eq!(
             digest,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+        return Ok(());
     }
 }
 """
