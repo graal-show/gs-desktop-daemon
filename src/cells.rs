@@ -54,6 +54,15 @@ pub struct CellPoolConfig {
     pub isolate_mode: String,
 }
 
+pub struct CellInvocation<'a> {
+    pub invocation_id: &'a str,
+    pub route_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub affinity: &'a str,
+    pub payload: &'a Value,
+    pub timeout_ms: u64,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CellKey {
     tenant_id: String,
@@ -200,29 +209,15 @@ impl CellPool {
         &self,
         tenant_id: &str,
         deployment_id: &str,
-        invocation_id: &str,
-        route_id: Option<&str>,
-        session_id: Option<&str>,
-        affinity: &str,
-        payload: &Value,
-        timeout_ms: u64,
+        invocation: CellInvocation<'_>,
     ) -> Result<Value> {
         let key = CellKey {
             tenant_id: tenant_id.to_owned(),
             deployment_id: deployment_id.to_owned(),
         };
         let (cell, _permit) = self.lease_cell(&key).await?;
-        let result = invoke_cell(
-            &cell,
-            invocation_id,
-            route_id,
-            session_id,
-            affinity,
-            payload,
-            timeout_ms,
-            Duration::from_millis(timeout_ms),
-        )
-        .await;
+        let deadline = Duration::from_millis(invocation.timeout_ms);
+        let result = invoke_cell(&cell, &invocation, deadline).await;
 
         if result.is_err() {
             cell.failed.store(true, Ordering::Release);
@@ -606,12 +601,7 @@ fn validate_path_component(value: &str) -> Result<()> {
 
 async fn invoke_cell(
     cell: &Arc<Cell>,
-    invocation_id: &str,
-    route_id: Option<&str>,
-    session_id: Option<&str>,
-    affinity: &str,
-    payload: &Value,
-    timeout_ms: u64,
+    invocation: &CellInvocation<'_>,
     deadline: Duration,
 ) -> Result<Value> {
     if cell.failed.load(Ordering::Acquire) || cell.draining.load(Ordering::Acquire) {
@@ -621,10 +611,10 @@ async fn invoke_cell(
     let (sender, receiver) = oneshot::channel();
     {
         let mut pending = cell.pending.lock().await;
-        if pending.contains_key(invocation_id) {
+        if pending.contains_key(invocation.invocation_id) {
             bail!("duplicate invocation_id in Graal cell");
         }
-        pending.insert(invocation_id.to_owned(), sender);
+        pending.insert(invocation.invocation_id.to_owned(), sender);
     }
 
     cell.active.fetch_add(1, Ordering::AcqRel);
@@ -633,18 +623,18 @@ async fn invoke_cell(
 
     let frame = json!({
         "frame_type": "invoke",
-        "invocation_id": invocation_id,
+        "invocation_id": invocation.invocation_id,
         "tenant_id": cell.key.tenant_id,
         "deployment_id": cell.key.deployment_id,
-        "route_id": route_id,
-        "session_id": session_id,
-        "affinity": affinity,
-        "timeout_ms": timeout_ms,
-        "payload": payload,
+        "route_id": invocation.route_id,
+        "session_id": invocation.session_id,
+        "affinity": invocation.affinity,
+        "timeout_ms": invocation.timeout_ms,
+        "payload": invocation.payload,
     });
     let encoded = serde_json::to_vec(&frame)?;
     if encoded.is_empty() || encoded.len() > MAX_FRAME_BYTES {
-        cell.pending.lock().await.remove(invocation_id);
+        cell.pending.lock().await.remove(invocation.invocation_id);
         cell.active.fetch_sub(1, Ordering::AcqRel);
         bail!("Graal invocation frame exceeded limit");
     }
@@ -660,7 +650,7 @@ async fn invoke_cell(
     }
     .await;
     if let Err(error) = write_result {
-        cell.pending.lock().await.remove(invocation_id);
+        cell.pending.lock().await.remove(invocation.invocation_id);
         cell.active.fetch_sub(1, Ordering::AcqRel);
         return Err(error).context("failed to write Graal invocation frame");
     }
@@ -674,7 +664,7 @@ async fn invoke_cell(
         Ok(Ok(Err(message))) => bail!(message),
         Ok(Err(_)) => bail!("Graal cell response channel closed"),
         Err(_) => {
-            cell.pending.lock().await.remove(invocation_id);
+            cell.pending.lock().await.remove(invocation.invocation_id);
             bail!("Graal invocation timed out; cell will be retired");
         }
     }
