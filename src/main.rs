@@ -608,7 +608,10 @@ fn validate_affinity<'a>(
         "route" if route_id.is_some() => Ok(affinity),
         "session" if session_id.is_some() => Ok(affinity),
         "route_session" if route_id.is_some() && session_id.is_some() => Ok(affinity),
-        "route" => Err((StatusCode::BAD_REQUEST, "route affinity requires route_id".to_owned())),
+        "route" => Err((
+            StatusCode::BAD_REQUEST,
+            "route affinity requires route_id".to_owned(),
+        )),
         "session" => Err((
             StatusCode::BAD_REQUEST,
             "session affinity requires session_id".to_owned(),
@@ -846,7 +849,10 @@ mod tests {
 
     #[test]
     fn affinity_requires_matching_keys() {
-        assert_eq!(validate_affinity("stateless", None, None).ok(), Some("stateless"));
+        assert_eq!(
+            validate_affinity("stateless", None, None).ok(),
+            Some("stateless")
+        );
         assert_eq!(
             validate_affinity("route", Some("orders.get"), None).ok(),
             Some("route")
@@ -857,12 +863,7 @@ mod tests {
             Some("session")
         );
         assert_eq!(
-            validate_affinity(
-                "route_session",
-                Some("orders.get"),
-                Some("session-1")
-            )
-            .ok(),
+            validate_affinity("route_session", Some("orders.get"), Some("session-1")).ok(),
             Some("route_session")
         );
     }
