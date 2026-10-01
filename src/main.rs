@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use cells::{CellPool, CellPoolConfig, CellStatus};
+use cells::{CellInvocation, CellPool, CellPoolConfig, CellStatus};
 use flags2env::BundledFlags2Env;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -566,12 +566,14 @@ async fn invoke(
         .invoke(
             &request.tenant_id,
             &request.deployment_id,
-            &request.invocation_id,
-            request.route_id.as_deref(),
-            request.session_id.as_deref(),
-            affinity,
-            &request.payload_json,
-            timeout_ms,
+            CellInvocation {
+                invocation_id: &request.invocation_id,
+                route_id: request.route_id.as_deref(),
+                session_id: request.session_id.as_deref(),
+                affinity,
+                payload: &request.payload_json,
+                timeout_ms,
+            },
         )
         .await;
     state.completed.fetch_add(1, Ordering::Relaxed);
