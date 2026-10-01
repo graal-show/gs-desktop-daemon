@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use cells::{CellPool, CellPoolConfig, CellStatus};
+use cells::{CellInvocation, CellPool, CellPoolConfig, CellStatus};
 use flags2env::BundledFlags2Env;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -33,8 +33,12 @@ const MAX_CELL_INVOCATIONS: u64 = 10_000_000;
 const MAX_LIVE_CELLS: usize = 4096;
 const MAX_CELLS_PER_GENERATION: usize = 64;
 const MAX_CELL_CONCURRENCY: usize = 1024;
+const MAX_STATELESS_ISOLATES: usize = 4096;
+const MAX_CONTEXTS_PER_ISOLATE: usize = 1024;
+const MAX_AFFINITY_ISOLATES: usize = 1_000_000;
 const MAX_CELL_IDLE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_CELL_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const MAX_AFFINITY_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
@@ -50,6 +54,13 @@ struct CliConfig {
     GS_MAX_CELL_CONCURRENCY: i64,
     GS_CELL_IDLE_TTL_MS: i64,
     GS_MAX_CELL_AGE_MS: i64,
+    GS_MAX_STATELESS_ISOLATES: i64,
+    GS_MAX_CONTEXTS_PER_ISOLATE: i64,
+    GS_MAX_ROUTE_ISOLATES: i64,
+    GS_MAX_SESSION_ISOLATES: i64,
+    GS_MAX_ROUTE_SESSION_ISOLATES: i64,
+    GS_SESSION_ISOLATE_TTL_MS: i64,
+    GS_ROUTE_ISOLATE_TTL_MS: i64,
     GS_MAX_ISOLATE_MEMORY: String,
     GS_MAX_GUEST_HEAP_MEMORY: String,
     GS_MAX_GUEST_CPU_TIME_MS: i64,
@@ -88,6 +99,9 @@ struct InvocationRequest {
     invocation_id: String,
     tenant_id: String,
     deployment_id: String,
+    route_id: Option<String>,
+    session_id: Option<String>,
+    affinity: Option<String>,
     payload_json: Value,
     timeout_ms: Option<u64>,
 }
@@ -109,6 +123,7 @@ struct StatusResponse {
     engine_cell_reusable: bool,
     cell_reuse_scope: &'static str,
     security_boundary: &'static str,
+    affinity_modes: [&'static str; 4],
     request_protocol: &'static str,
     config_source: &'static str,
     uptime_ms: u128,
@@ -121,6 +136,12 @@ struct StatusResponse {
     max_cells_per_generation: usize,
     max_cell_concurrency: usize,
     max_cell_invocations: u64,
+    max_stateless_isolates: usize,
+    max_route_isolates: usize,
+    max_session_isolates: usize,
+    max_route_session_isolates: usize,
+    session_isolate_ttl_ms: u128,
+    route_isolate_ttl_ms: u128,
 }
 
 #[tokio::main]
@@ -251,6 +272,41 @@ fn load_config() -> Result<RuntimeConfig> {
         raw_config.GS_MAX_CELL_AGE_MS,
         MAX_CELL_AGE_MS,
     )?;
+    let max_stateless_isolates = bounded_usize(
+        "GS_MAX_STATELESS_ISOLATES",
+        raw_config.GS_MAX_STATELESS_ISOLATES,
+        MAX_STATELESS_ISOLATES,
+    )?;
+    let max_contexts_per_isolate = bounded_usize(
+        "GS_MAX_CONTEXTS_PER_ISOLATE",
+        raw_config.GS_MAX_CONTEXTS_PER_ISOLATE,
+        MAX_CONTEXTS_PER_ISOLATE,
+    )?;
+    let max_route_isolates = bounded_usize(
+        "GS_MAX_ROUTE_ISOLATES",
+        raw_config.GS_MAX_ROUTE_ISOLATES,
+        MAX_AFFINITY_ISOLATES,
+    )?;
+    let max_session_isolates = bounded_usize(
+        "GS_MAX_SESSION_ISOLATES",
+        raw_config.GS_MAX_SESSION_ISOLATES,
+        MAX_AFFINITY_ISOLATES,
+    )?;
+    let max_route_session_isolates = bounded_usize(
+        "GS_MAX_ROUTE_SESSION_ISOLATES",
+        raw_config.GS_MAX_ROUTE_SESSION_ISOLATES,
+        MAX_AFFINITY_ISOLATES,
+    )?;
+    let session_isolate_ttl_ms = bounded_u64(
+        "GS_SESSION_ISOLATE_TTL_MS",
+        raw_config.GS_SESSION_ISOLATE_TTL_MS,
+        MAX_AFFINITY_TTL_MS,
+    )?;
+    let route_isolate_ttl_ms = bounded_u64(
+        "GS_ROUTE_ISOLATE_TTL_MS",
+        raw_config.GS_ROUTE_ISOLATE_TTL_MS,
+        MAX_AFFINITY_TTL_MS,
+    )?;
     let max_guest_cpu_time_ms = bounded_u64(
         "GS_MAX_GUEST_CPU_TIME_MS",
         raw_config.GS_MAX_GUEST_CPU_TIME_MS,
@@ -291,6 +347,13 @@ fn load_config() -> Result<RuntimeConfig> {
             max_cell_invocations,
             cell_idle_ttl: Duration::from_millis(cell_idle_ttl_ms),
             max_cell_age: Duration::from_millis(max_cell_age_ms),
+            max_stateless_isolates,
+            max_contexts_per_isolate,
+            max_route_isolates,
+            max_session_isolates,
+            max_route_session_isolates,
+            session_isolate_ttl: Duration::from_millis(session_isolate_ttl_ms),
+            route_isolate_ttl: Duration::from_millis(route_isolate_ttl_ms),
             max_isolate_memory,
             max_guest_heap_memory,
             max_guest_cpu_time_ms,
@@ -369,11 +432,12 @@ async fn status(
     authorize(&headers, &state)?;
     return Ok(Json(StatusResponse {
         runtime: "graalvm_polyglot",
-        logical_actor_reusable: false,
-        context_reusable: false,
+        logical_actor_reusable: true,
+        context_reusable: true,
         engine_cell_reusable: true,
         cell_reuse_scope: "same_tenant_generation",
-        security_boundary: "polyglot_isolate_in_tenant_process",
+        security_boundary: "os_process_per_tenant_generation",
+        affinity_modes: ["stateless", "route", "session", "route_session"],
         request_protocol: "u32be_length_prefixed_json_v1",
         config_source: "flags-2-env",
         uptime_ms: state.started_at.elapsed().as_millis(),
@@ -386,6 +450,12 @@ async fn status(
         max_cells_per_generation: state.cells.max_cells_per_generation(),
         max_cell_concurrency: state.cells.max_cell_concurrency(),
         max_cell_invocations: state.cells.max_cell_invocations(),
+        max_stateless_isolates: state.cells.max_stateless_isolates(),
+        max_route_isolates: state.cells.max_route_isolates(),
+        max_session_isolates: state.cells.max_session_isolates(),
+        max_route_session_isolates: state.cells.max_route_session_isolates(),
+        session_isolate_ttl_ms: state.cells.session_isolate_ttl_ms(),
+        route_isolate_ttl_ms: state.cells.route_isolate_ttl_ms(),
     }));
 }
 
@@ -463,6 +533,17 @@ async fn invoke(
     validate_identifier("invocation_id", &request.invocation_id)?;
     validate_identifier("tenant_id", &request.tenant_id)?;
     validate_identifier("deployment_id", &request.deployment_id)?;
+    if let Some(route_id) = request.route_id.as_deref() {
+        validate_identifier("route_id", route_id)?;
+    }
+    if let Some(session_id) = request.session_id.as_deref() {
+        validate_identifier("session_id", session_id)?;
+    }
+    let affinity = validate_affinity(
+        request.affinity.as_deref().unwrap_or("stateless"),
+        request.route_id.as_deref(),
+        request.session_id.as_deref(),
+    )?;
 
     let timeout_ms = request.timeout_ms.unwrap_or(30_000);
     if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
@@ -485,9 +566,14 @@ async fn invoke(
         .invoke(
             &request.tenant_id,
             &request.deployment_id,
-            &request.invocation_id,
-            &request.payload_json,
-            timeout_ms,
+            CellInvocation {
+                invocation_id: &request.invocation_id,
+                route_id: request.route_id.as_deref(),
+                session_id: request.session_id.as_deref(),
+                affinity,
+                payload: &request.payload_json,
+                timeout_ms,
+            },
         )
         .await;
     state.completed.fetch_add(1, Ordering::Relaxed);
@@ -512,6 +598,32 @@ async fn invoke(
         },
     };
     return Ok(Json(response));
+}
+
+fn validate_affinity<'a>(
+    affinity: &'a str,
+    route_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<&'a str, (StatusCode, String)> {
+    match affinity {
+        "stateless" => Ok(affinity),
+        "route" if route_id.is_some() => Ok(affinity),
+        "session" if session_id.is_some() => Ok(affinity),
+        "route_session" if route_id.is_some() && session_id.is_some() => Ok(affinity),
+        "route" => Err((
+            StatusCode::BAD_REQUEST,
+            "route affinity requires route_id".to_owned(),
+        )),
+        "session" => Err((
+            StatusCode::BAD_REQUEST,
+            "session affinity requires session_id".to_owned(),
+        )),
+        "route_session" => Err((
+            StatusCode::BAD_REQUEST,
+            "route_session affinity requires route_id and session_id".to_owned(),
+        )),
+        _ => Err((StatusCode::BAD_REQUEST, "unsupported affinity".to_owned())),
+    }
 }
 
 fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
@@ -735,6 +847,27 @@ mod tests {
         assert!(validate_identifier("deployment_id", "deployment-1").is_ok());
         assert!(validate_identifier("deployment_id", "..").is_err());
         assert!(validate_identifier("deployment_id", "tenant/escape").is_err());
+    }
+
+    #[test]
+    fn affinity_requires_matching_keys() {
+        assert_eq!(
+            validate_affinity("stateless", None, None).ok(),
+            Some("stateless")
+        );
+        assert_eq!(
+            validate_affinity("route", Some("orders.get"), None).ok(),
+            Some("route")
+        );
+        assert!(validate_affinity("route", None, None).is_err());
+        assert_eq!(
+            validate_affinity("session", None, Some("session-1")).ok(),
+            Some("session")
+        );
+        assert_eq!(
+            validate_affinity("route_session", Some("orders.get"), Some("session-1")).ok(),
+            Some("route_session")
+        );
     }
 
     #[test]

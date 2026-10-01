@@ -52,42 +52,91 @@ env = "GS_MAX_LIVE_CELLS"
 aliases = ["max-live-cells"]
 type = "integer"
 default = 256
-help = "Maximum simultaneously resident tenant+deployment Graal process cells."
+help = "Maximum simultaneously resident tenant+deployment process cells."
 
 [flags.max-cells-per-generation]
 env = "GS_MAX_CELLS_PER_GENERATION"
 aliases = ["max-cells-per-generation"]
 type = "integer"
 default = 4
-help = "Maximum warm process/Engine cells for one tenant+deployment generation."
+help = "Maximum warm process cells for one tenant+deployment generation."
 
 [flags.max-cell-concurrency]
 env = "GS_MAX_CELL_CONCURRENCY"
 aliases = ["max-cell-concurrency"]
 type = "integer"
 default = 16
-help = "Maximum concurrent fresh Graal Contexts within one warm Engine cell."
+help = "Maximum concurrent invocations multiplexed through one tenant process cell."
 
 [flags.cell-idle-ttl-ms]
 env = "GS_CELL_IDLE_TTL_MS"
 aliases = ["cell-idle-ttl-ms"]
 type = "integer"
 default = 300000
-help = "Retire an idle Graal cell after this many milliseconds."
+help = "Retire an idle tenant process cell after this many milliseconds."
 
 [flags.max-cell-age-ms]
 env = "GS_MAX_CELL_AGE_MS"
 aliases = ["max-cell-age-ms"]
 type = "integer"
 default = 3600000
-help = "Recycle a warm Graal cell after this maximum age in milliseconds."
+help = "Recycle a warm tenant process cell after this maximum age in milliseconds."
+
+[flags.max-stateless-isolates]
+env = "GS_MAX_STATELESS_ISOLATES"
+aliases = ["max-stateless-isolates"]
+type = "integer"
+default = 2
+help = "Pre-warmed stateless Polyglot Engine/isolate slots in each tenant process."
+
+[flags.max-contexts-per-isolate]
+env = "GS_MAX_CONTEXTS_PER_ISOLATE"
+aliases = ["max-contexts-per-isolate"]
+type = "integer"
+default = 8
+help = "Maximum concurrent request Contexts admitted inside one route/stateless Polyglot isolate."
+
+[flags.max-route-isolates]
+env = "GS_MAX_ROUTE_ISOLATES"
+aliases = ["max-route-isolates"]
+type = "integer"
+default = 128
+help = "Maximum warm route-affinity isolates in one tenant process."
+
+[flags.max-session-isolates]
+env = "GS_MAX_SESSION_ISOLATES"
+aliases = ["max-session-isolates"]
+type = "integer"
+default = 1024
+help = "Maximum warm user/session-affinity isolates in one tenant process."
+
+[flags.max-route-session-isolates]
+env = "GS_MAX_ROUTE_SESSION_ISOLATES"
+aliases = ["max-route-session-isolates"]
+type = "integer"
+default = 2048
+help = "Maximum composite route+session affinity isolates in one tenant process."
+
+[flags.session-isolate-ttl-ms]
+env = "GS_SESSION_ISOLATE_TTL_MS"
+aliases = ["session-isolate-ttl-ms"]
+type = "integer"
+default = 300000
+help = "Idle TTL for session and route_session isolates; default is five minutes."
+
+[flags.route-isolate-ttl-ms]
+env = "GS_ROUTE_ISOLATE_TTL_MS"
+aliases = ["route-isolate-ttl-ms"]
+type = "integer"
+default = 3600000
+help = "Idle TTL for route-affinity isolates before reclamation."
 
 [flags.max-isolate-memory]
 env = "GS_MAX_ISOLATE_MEMORY"
 aliases = ["max-isolate-memory"]
 type = "string"
 default = "256MB"
-help = "Maximum memory for the tenant Polyglot isolate."
+help = "Maximum memory for one Polyglot isolate."
 
 [flags.max-guest-heap-memory]
 env = "GS_MAX_GUEST_HEAP_MEMORY"
@@ -136,7 +185,7 @@ env = "GS_ISOLATE_MODE"
 aliases = ["isolate-mode"]
 type = "string"
 default = "internal"
-help = "Polyglot isolate mode: internal or external. External is an experimental GraalVM 25 hardening option."
+help = "Polyglot isolate mode: internal or external. External intentionally changes process topology."
 
 [flags.token-file]
 env = "GS_DESKTOP_TOKEN_FILE"

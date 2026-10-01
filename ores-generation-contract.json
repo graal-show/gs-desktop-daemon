@@ -6,7 +6,17 @@
   "rollback": {"required_before_commit": true, "retain_previous_generation": true},
   "request_semantics": {"new_requests": "active_generation", "existing_requests": "pinned_generation", "generation_identity_required": true},
   "routing": {"dynamic_route_authority": "shared_router_generation", "edge_proxy_route_authority": false, "stable_edges": ["nginx", "haproxy", "caddy"]},
+  "isolation": {
+    "tenant_boundary": "os_process_per_tenant_generation",
+    "affinity_modes": ["stateless", "route", "session", "route_session"],
+    "route_id_required_for": ["route", "route_session"],
+    "session_id_required_for": ["session", "route_session"],
+    "session_id_source": "trusted_auth_or_router",
+    "session_idle_ttl_ms_default": 300000,
+    "route_session_opt_in": true,
+    "unbounded_affinity_cardinality_forbidden": true
+  },
   "middleware": {"parameter_changes": "atomic_generation_swap", "code_changes": "wasm_generation_or_proven_beam_upgrade", "beam_code_reload_requires_drain_or_otp_proof": true},
-  "role_requirements": ["sole_lifecycle_authority", "bounded_drain_enforced", "rollback_before_commit", "no_arbitrary_process_commands", "surface_generation_status", "jvm_native_compute_uses_generation_handoff"],
+  "role_requirements": ["sole_lifecycle_authority", "bounded_drain_enforced", "rollback_before_commit", "no_arbitrary_process_commands", "surface_generation_status", "jvm_native_compute_uses_generation_handoff", "surface_isolate_affinity_limits"],
   "verification": {"shared_conformance_required": true, "product_e2e_required": true, "promotion_state": "candidate"}
 }
