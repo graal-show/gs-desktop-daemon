@@ -37,6 +37,13 @@ pub struct CellPoolConfig {
     pub max_cell_invocations: u64,
     pub cell_idle_ttl: Duration,
     pub max_cell_age: Duration,
+    pub max_stateless_isolates: usize,
+    pub max_contexts_per_isolate: usize,
+    pub max_route_isolates: usize,
+    pub max_session_isolates: usize,
+    pub max_route_session_isolates: usize,
+    pub session_isolate_ttl: Duration,
+    pub route_isolate_ttl: Duration,
     pub max_isolate_memory: String,
     pub max_guest_heap_memory: String,
     pub max_guest_cpu_time_ms: u64,
@@ -127,6 +134,30 @@ impl CellPool {
         return self.inner.config.max_cell_invocations;
     }
 
+    pub fn max_stateless_isolates(&self) -> usize {
+        return self.inner.config.max_stateless_isolates;
+    }
+
+    pub fn max_route_isolates(&self) -> usize {
+        return self.inner.config.max_route_isolates;
+    }
+
+    pub fn max_session_isolates(&self) -> usize {
+        return self.inner.config.max_session_isolates;
+    }
+
+    pub fn max_route_session_isolates(&self) -> usize {
+        return self.inner.config.max_route_session_isolates;
+    }
+
+    pub fn session_isolate_ttl_ms(&self) -> u128 {
+        return self.inner.config.session_isolate_ttl.as_millis();
+    }
+
+    pub fn route_isolate_ttl_ms(&self) -> u128 {
+        return self.inner.config.route_isolate_ttl.as_millis();
+    }
+
     pub fn available_cell_slots(&self) -> usize {
         return self.inner.cell_slots.available_permits();
     }
@@ -170,6 +201,9 @@ impl CellPool {
         tenant_id: &str,
         deployment_id: &str,
         invocation_id: &str,
+        route_id: Option<&str>,
+        session_id: Option<&str>,
+        affinity: &str,
         payload: &Value,
         timeout_ms: u64,
     ) -> Result<Value> {
@@ -181,6 +215,9 @@ impl CellPool {
         let result = invoke_cell(
             &cell,
             invocation_id,
+            route_id,
+            session_id,
+            affinity,
             payload,
             timeout_ms,
             Duration::from_millis(timeout_ms),
@@ -356,6 +393,34 @@ impl CellPool {
             .env(
                 "GS_MAX_CELL_CONCURRENCY",
                 self.inner.config.max_cell_concurrency.to_string(),
+            )
+            .env(
+                "GS_MAX_STATELESS_ISOLATES",
+                self.inner.config.max_stateless_isolates.to_string(),
+            )
+            .env(
+                "GS_MAX_CONTEXTS_PER_ISOLATE",
+                self.inner.config.max_contexts_per_isolate.to_string(),
+            )
+            .env(
+                "GS_MAX_ROUTE_ISOLATES",
+                self.inner.config.max_route_isolates.to_string(),
+            )
+            .env(
+                "GS_MAX_SESSION_ISOLATES",
+                self.inner.config.max_session_isolates.to_string(),
+            )
+            .env(
+                "GS_MAX_ROUTE_SESSION_ISOLATES",
+                self.inner.config.max_route_session_isolates.to_string(),
+            )
+            .env(
+                "GS_SESSION_ISOLATE_TTL_MS",
+                self.inner.config.session_isolate_ttl.as_millis().to_string(),
+            )
+            .env(
+                "GS_ROUTE_ISOLATE_TTL_MS",
+                self.inner.config.route_isolate_ttl.as_millis().to_string(),
             )
             .env(
                 "GS_MAX_ISOLATE_MEMORY",
@@ -538,6 +603,9 @@ fn validate_path_component(value: &str) -> Result<()> {
 async fn invoke_cell(
     cell: &Arc<Cell>,
     invocation_id: &str,
+    route_id: Option<&str>,
+    session_id: Option<&str>,
+    affinity: &str,
     payload: &Value,
     timeout_ms: u64,
     deadline: Duration,
@@ -564,6 +632,9 @@ async fn invoke_cell(
         "invocation_id": invocation_id,
         "tenant_id": cell.key.tenant_id,
         "deployment_id": cell.key.deployment_id,
+        "route_id": route_id,
+        "session_id": session_id,
+        "affinity": affinity,
         "timeout_ms": timeout_ms,
         "payload": payload,
     });
