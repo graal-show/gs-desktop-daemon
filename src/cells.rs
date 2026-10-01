@@ -416,7 +416,11 @@ impl CellPool {
             )
             .env(
                 "GS_SESSION_ISOLATE_TTL_MS",
-                self.inner.config.session_isolate_ttl.as_millis().to_string(),
+                self.inner
+                    .config
+                    .session_isolate_ttl
+                    .as_millis()
+                    .to_string(),
             )
             .env(
                 "GS_ROUTE_ISOLATE_TTL_MS",
