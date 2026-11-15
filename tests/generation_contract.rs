@@ -4,15 +4,17 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 fn load_contract() -> Result<Value> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ores-generation-contract.json");
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let content = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&content).context("parse generation contract JSON")
 }
 
 /// This validates the consumer contract itself; it does not claim that the
 /// shared authority implementation or runtime handoff has passed conformance.
 fn verify_contract(d: &Value) -> Result<()> {
-    ensure!(d["schema"] == "ores.desktop-generation-consumer/v1", "wrong schema");
+    ensure!(
+        d["schema"] == "ores.desktop-generation-consumer/v1",
+        "wrong schema"
+    );
     ensure!(
         d["consumer"]["repository"] == "graal-show/gs-desktop-daemon",
         "wrong consumer identity"
@@ -43,10 +45,11 @@ fn verify_contract(d: &Value) -> Result<()> {
         "lifecycle must preserve the generation activation order"
     );
     ensure!(
-        d["rollback"] == json!({
-            "required_before_commit": true,
-            "retain_previous_generation": true
-        }),
+        d["rollback"]
+            == json!({
+                "required_before_commit": true,
+                "retain_previous_generation": true
+            }),
         "rollback must be possible before commit"
     );
     ensure!(
@@ -107,15 +110,27 @@ fn critical_contract_mutations_fail_closed() -> Result<()> {
         ("/rollback/required_before_commit", json!(false)),
         ("/rollback/retain_previous_generation", json!(false)),
         ("/request_semantics/new_requests", json!("any_generation")),
-        ("/request_semantics/existing_requests", json!("latest_generation")),
-        ("/request_semantics/generation_identity_required", json!(false)),
+        (
+            "/request_semantics/existing_requests",
+            json!("latest_generation"),
+        ),
+        (
+            "/request_semantics/generation_identity_required",
+            json!(false),
+        ),
         ("/routing/edge_proxy_route_authority", json!(true)),
         ("/routing/stable_edges", json!(["nginx", "haproxy"])),
         ("/isolation/tenant_boundary", json!("shared_process")),
-        ("/isolation/unbounded_affinity_cardinality_forbidden", json!(false)),
+        (
+            "/isolation/unbounded_affinity_cardinality_forbidden",
+            json!(false),
+        ),
         ("/isolation/session_id_source", json!("guest_provided")),
         ("/isolation/route_session_opt_in", json!(false)),
-        ("/middleware/beam_code_reload_requires_drain_or_otp_proof", json!(false)),
+        (
+            "/middleware/beam_code_reload_requires_drain_or_otp_proof",
+            json!(false),
+        ),
         ("/verification/shared_conformance_required", json!(false)),
         ("/verification/product_e2e_required", json!(false)),
         ("/verification/promotion_state", json!("approved")),
@@ -140,12 +155,18 @@ fn absent_revision_and_missing_stable_edge_also_fail_closed() -> Result<()> {
         .as_object_mut()
         .context("authority object")?
         .remove("revision");
-    ensure!(verify_contract(&invalid).is_err(), "missing revision accepted");
+    ensure!(
+        verify_contract(&invalid).is_err(),
+        "missing revision accepted"
+    );
     let mut invalid = load_contract()?;
     invalid["routing"]
         .as_object_mut()
         .context("routing object")?
         .remove("stable_edges");
-    ensure!(verify_contract(&invalid).is_err(), "missing edge list accepted");
+    ensure!(
+        verify_contract(&invalid).is_err(),
+        "missing edge list accepted"
+    );
     Ok(())
 }
